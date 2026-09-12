@@ -61,6 +61,99 @@ logger.setLevel(logging.INFO)
 
 
 # ---------------------------------------------------------------------------
+# Query safety / deterministic fallback helpers
+# ---------------------------------------------------------------------------
+
+# These are query-level exclusions, not company lists. They reduce wasted
+# Tavily calls on pages that are clearly about investors rather than companies.
+DISALLOWED_QUERY_PHRASES = (
+    "investor list",
+    "investor lists",
+    "vc firms",
+    "venture capital firms",
+    "top investors",
+    "funding list",
+    "funding lists",
+    "investor directory",
+    "investor directories",
+)
+
+FINANCIAL_QUERY_TERMS = (
+    "raised",
+    "funding",
+    "secured",
+    "revenue",
+    "arr",
+)
+
+
+def _is_company_discovery_query(query: str) -> bool:
+    """Return True when a generated query is suitable for company discovery."""
+    normalized = " ".join(query.lower().split())
+
+    if any(phrase in normalized for phrase in DISALLOWED_QUERY_PHRASES):
+        return False
+
+    return any(term in normalized for term in FINANCIAL_QUERY_TERMS)
+
+
+def _fallback_queries(
+    sector: str,
+    geography: str,
+    count: int,
+) -> List[str]:
+    """Generate deterministic discovery queries when Groq cannot return JSON.
+
+    The fallback intentionally contains no company names. It is only a set of
+    search strategies that lets the autonomous pipeline continue when the LLM
+    planner has a transient/API/JSON failure.
+    """
+    templates = [
+        (
+            f'"{sector}" platform SaaS startup '
+            f'("raised $2 million" OR "raised $3 million" OR "raised $4 million" '
+            f'OR "raised $5 million") "{geography}" '
+            '-investor -investors -"venture capital" -jobs -careers -directory'
+        ),
+        (
+            f'"{sector}" software company platform '
+            f'("secured $2 million" OR "secured $3 million" OR "secured $4 million" '
+            f'OR "secured $5 million") "{geography}" '
+            '-investor -investors -"venture capital" -jobs -careers -directory'
+        ),
+        (
+            f'"{sector}" SaaS platform "{geography}" '
+            f'("annual revenue $2 million" OR "annual revenue $3 million" '
+            f'OR "annual revenue $4 million" OR "annual revenue $5 million" '
+            f'OR "ARR $2 million" OR "ARR $3 million" OR "ARR $4 million" '
+            f'OR "ARR $5 million") '
+            '-investor -investors -"venture capital" -jobs -careers -directory'
+        ),
+        (
+            f'"{sector}" technology platform "{geography}" '
+            f'("funding" OR "raised" OR "revenue" OR "ARR") '
+            f'company startup SaaS '
+            '-investor -investors -"venture capital" -jobs -careers -directory'
+        ),
+        (
+            f'"{sector}" software platform "{geography}" '
+            f'("seed round" OR "pre-Series A" OR "funding round") '
+            f'("$1M" OR "$2M" OR "$3M" OR "$4M" OR "$5M") '
+            '-investor -investors -"venture capital" -jobs -careers -directory'
+        ),
+    ]
+
+    clean: List[str] = []
+    for query in templates:
+        if query not in clean and _is_company_discovery_query(query):
+            clean.append(query)
+        if len(clean) >= max(1, count):
+            break
+
+    return clean
+
+
+# ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
 
@@ -355,7 +448,9 @@ class QueryPlanner:
                 response_format={
                     "type": "json_object",
                 },
-                temperature=0.7,
+                temperature=0.3,
+                include_reasoning=False,
+                max_completion_tokens=700,
             )
 
             raw_content = response.choices[0].message.content
@@ -391,17 +486,37 @@ class QueryPlanner:
                 if not query_text:
                     continue
 
+                # Reject query strategies that are clearly aimed at investor
+                # lists/directories or lack any financial evidence signal.
+                if not _is_company_discovery_query(query_text):
+                    logger.info(
+                        "Discarding unsuitable planner query: %s",
+                        query_text,
+                    )
+                    continue
+
                 # Avoid accidental duplicates while preserving order.
                 if query_text not in clean_queries:
                     clean_queries.append(query_text)
 
             if not clean_queries:
+                logger.warning(
+                    "Groq returned no suitable company-discovery queries; "
+                    "using deterministic fallback."
+                )
+                clean_queries = _fallback_queries(
+                    selected_sector,
+                    selected_geography,
+                    count,
+                )
+
+            if not clean_queries:
                 raise PlannerError(
-                    "Groq returned no usable search queries."
+                    "Unable to generate usable company-discovery queries."
                 )
 
             logger.info(
-                "Successfully generated %d search queries via Groq",
+                "Successfully generated %d search queries via Groq/fallback",
                 len(clean_queries),
             )
 
@@ -422,25 +537,39 @@ class QueryPlanner:
         # -------------------------------------------------------------------
 
         except json.JSONDecodeError as exc:
-            error_message = (
-                f"Failed to parse JSON response from Groq: {exc}"
+            logger.warning(
+                "Groq planner returned invalid JSON; using deterministic "
+                "fallback queries: %s",
+                exc,
             )
-
-            logger.error(error_message)
+            fallback = _fallback_queries(
+                selected_sector,
+                selected_geography,
+                count,
+            )
+            if fallback:
+                return fallback
 
             raise PlannerError(
-                error_message
+                f"Failed to parse JSON response from Groq: {exc}"
             ) from exc
 
         except Exception as exc:
-            error_message = (
-                f"Groq API call failed: {exc}"
+            logger.warning(
+                "Groq planner call failed; using deterministic fallback "
+                "queries: %s",
+                exc,
             )
-
-            logger.error(error_message)
+            fallback = _fallback_queries(
+                selected_sector,
+                selected_geography,
+                count,
+            )
+            if fallback:
+                return fallback
 
             raise PlannerError(
-                error_message
+                f"Groq API call failed: {exc}"
             ) from exc
 
 
