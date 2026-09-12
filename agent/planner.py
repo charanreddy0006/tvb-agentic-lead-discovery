@@ -1,8 +1,11 @@
 """Query planning component for TVB Agentic Company Lead Discovery.
 
 Uses Groq LLM to dynamically generate targeted search queries based on
-technology sectors, non-US geographies, and TVB's $1M–$5M funding parameters.
-Does NOT hardcode any company names.
+technology sectors, non-US geographies, and TVB's $1M-$5M funding/revenue
+parameters.
+
+The planner does NOT hardcode any company names. Companies must be
+discovered dynamically through web search.
 """
 
 import json
@@ -13,7 +16,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
-# Ensure Windows console handles UTF-8 characters without CharMap errors
+# Ensure Windows console handles UTF-8 characters without CharMap errors.
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -27,13 +30,24 @@ from groq import Groq
 from core.models import SearchResult
 from services.search_service import TavilySearchService
 
-# Load environment variables from project root .env
+
+# ---------------------------------------------------------------------------
+# Environment configuration
+# ---------------------------------------------------------------------------
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Load project-level .env first, then the default environment.
 load_dotenv(PROJECT_ROOT / ".env")
 load_dotenv()
 
-# Configure module-level logger
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
 logger = logging.getLogger("tvb.planner")
+
 if not logger.handlers:
     handler = logging.StreamHandler()
     formatter = logging.Formatter(
@@ -42,15 +56,25 @@ if not logger.handlers:
     )
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
+
+logger.setLevel(logging.INFO)
+
+
+# ---------------------------------------------------------------------------
+# Exceptions
+# ---------------------------------------------------------------------------
 
 
 class PlannerError(Exception):
     """Base exception for Query Planner errors."""
-    pass
 
 
-# Curated strategic themes for autonomous search diversity (no hardcoded company names)
+# ---------------------------------------------------------------------------
+# Search strategy configuration
+# ---------------------------------------------------------------------------
+
+# Curated strategic themes for autonomous search diversity.
+# These are sector themes, NOT company names.
 TARGET_SECTORS = [
     "B2B SaaS",
     "AI platform",
@@ -62,6 +86,7 @@ TARGET_SECTORS = [
     "education technology",
     "cloud management & DevOps",
 ]
+
 
 TARGET_GEOGRAPHIES = [
     "United Kingdom",
@@ -75,10 +100,23 @@ TARGET_GEOGRAPHIES = [
 ]
 
 
-class QueryPlanner:
-    """Generates dynamic search queries using Groq LLM without fixed company lists."""
+# ---------------------------------------------------------------------------
+# Query Planner
+# ---------------------------------------------------------------------------
 
-    DEFAULT_MODEL = "openai/gpt-oss-120b"
+
+class QueryPlanner:
+    """Generate dynamic web-search queries using Groq.
+
+    The planner intentionally does not contain a fixed company list.
+    Each invocation can use different sector/geography combinations and
+    asks the LLM to produce multiple search strategies.
+    """
+
+    # 20B is the safer default for the current Groq usage budget.
+    DEFAULT_MODEL = "openai/gpt-oss-20b"
+
+    # Kept for compatibility with existing code/tests.
     FALLBACK_MODEL = "openai/gpt-oss-20b"
 
     def __init__(
@@ -90,39 +128,76 @@ class QueryPlanner:
         """Initialize the Query Planner.
 
         Args:
-            api_key: Optional Groq API key. Defaults to GROQ_API_KEY from environment.
-            model: Groq model name to use. Defaults to llama-3.3-70b-versatile.
+            api_key: Optional Groq API key. Defaults to GROQ_API_KEY.
+            model: Optional Groq model override.
             timeout: Request timeout in seconds.
         """
         self.api_key = api_key or os.getenv("GROQ_API_KEY")
-        self.model = model or os.getenv("GROQ_MODEL", self.DEFAULT_MODEL)
+
+        # Respect an explicitly supplied model or GROQ_MODEL.
+        # If GROQ_MODEL is blank, fall back to the safe 20B default.
+        configured_model = os.getenv("GROQ_MODEL")
+
+        self.model = (
+            model
+            or configured_model
+            or self.DEFAULT_MODEL
+        )
+
         self.timeout = timeout
         self.client: Optional[Groq] = None
 
-        if not self.api_key or self.api_key.strip() in ("", "your_groq_api_key_here"):
+        if not self.api_key or self.api_key.strip() in (
+            "",
+            "your_groq_api_key_here",
+        ):
             logger.warning(
                 "GROQ_API_KEY is not configured or contains placeholder text. "
-                "Query generation via LLM will require a valid key in .env."
+                "Query generation via LLM will require a valid key."
             )
         else:
             try:
-                self.client = Groq(api_key=self.api_key, timeout=self.timeout)
-            except Exception as e:
-                logger.error("Failed to initialize Groq client: %s", e)
+                self.client = Groq(
+                    api_key=self.api_key,
+                    timeout=self.timeout,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Failed to initialize Groq client: %s",
+                    exc,
+                )
                 self.client = None
 
+    # -----------------------------------------------------------------------
+    # Client validation
+    # -----------------------------------------------------------------------
+
     def _validate_client(self) -> None:
-        """Validate that Groq client is properly configured."""
-        if not self.api_key or self.api_key.strip() in ("", "your_groq_api_key_here"):
+        """Validate that the Groq client is properly configured."""
+
+        if not self.api_key or self.api_key.strip() in (
+            "",
+            "your_groq_api_key_here",
+        ):
             raise PlannerError(
-                "GROQ_API_KEY is missing or unconfigured. Please set a valid Groq API key "
-                "in your .env file (e.g. GROQ_API_KEY=gsk_xxxxxxxx)."
+                "GROQ_API_KEY is missing or unconfigured. "
+                "Please set a valid Groq API key."
             )
+
         if self.client is None:
             try:
-                self.client = Groq(api_key=self.api_key, timeout=self.timeout)
-            except Exception as e:
-                raise PlannerError(f"Could not connect to Groq client: {e}") from e
+                self.client = Groq(
+                    api_key=self.api_key,
+                    timeout=self.timeout,
+                )
+            except Exception as exc:
+                raise PlannerError(
+                    f"Could not connect to Groq client: {exc}"
+                ) from exc
+
+    # -----------------------------------------------------------------------
+    # Dynamic query generation
+    # -----------------------------------------------------------------------
 
     def generate_queries(
         self,
@@ -130,99 +205,248 @@ class QueryPlanner:
         geography: Optional[str] = None,
         count: int = 3,
     ) -> List[str]:
-        """Generate targeted web search queries dynamically using Groq LLM.
+        """Generate targeted web-search queries dynamically using Groq.
 
         Args:
-            sector: Target technology domain (e.g., 'B2B SaaS', 'AI platform').
-            geography: Non-US geographic market (e.g., 'Europe', 'India', 'MENA').
-            count: Number of diverse search queries to generate (default: 3).
+            sector:
+                Target technology domain, such as B2B SaaS,
+                cybersecurity, AI platform, etc.
+
+            geography:
+                Non-US geographic market.
+
+            count:
+                Number of distinct search queries requested.
 
         Returns:
-            List of generated search query strings designed for web search engines.
+            A list of cleaned search query strings.
 
         Raises:
-            PlannerError: If the API key is missing or Groq API call fails.
+            PlannerError:
+                If the Groq API is unavailable or returns invalid data.
         """
+
         self._validate_client()
         assert self.client is not None
 
-        selected_sector = sector or random.choice(TARGET_SECTORS)
-        selected_geography = geography or random.choice(TARGET_GEOGRAPHIES)
-
-        system_prompt = (
-            "You are an autonomous research strategist for The Venture Build (TVB), "
-            "an AI-powered venture catalyst and venture operating platform that helps startups "
-            "and scale-ups grow through execution, market access, operator support, partner "
-            "ecosystems, and capital readiness.\n"
-            "TVB seeks early-stage technology platform companies meeting these strict parameters:\n"
-            "1. Financials: $1,000,000 to $5,000,000 USD in funding raised or annual revenue.\n"
-            "2. Business Model: Technology platform (SaaS, PaaS, Cloud, Developer Tooling, Data, AI).\n"
-            "3. Location: Strictly NON-US based (UK, Europe, India, Southeast Asia, MENA, LATAM, etc.).\n\n"
-            "CRITICAL RULES:\n"
-            "- Do NOT output or name specific known companies.\n"
-            "- Prioritize evidence-rich funding announcements, investor or company press releases, "
-            "and official company pages that state exact USD funding of $1M-$5M or annual revenue/ARR "
-            "of $1M-$5M.\n"
-            "- Prefer sources that explicitly state headquarters, technology platform/product details, "
-            "and any US operational presence.\n"
-            "- Use search operators where effective (e.g. quotes, OR, site: filters, exclusion -USA).\n"
-            "- Output valid JSON ONLY in this exact format: {\"queries\": [\"query 1\", \"query 2\", ...]}"
+        # Randomized themes provide discovery diversity when the pipeline
+        # doesn't explicitly provide a sector or geography.
+        selected_sector = (
+            sector
+            or random.choice(TARGET_SECTORS)
         )
 
+        selected_geography = (
+            geography
+            or random.choice(TARGET_GEOGRAPHIES)
+        )
+
+        # -------------------------------------------------------------------
+        # System prompt
+        # -------------------------------------------------------------------
+
+        system_prompt = (
+            "You are an autonomous research strategist for The Venture Build "
+            "(TVB), an AI-powered venture catalyst and venture operating "
+            "platform that helps startups and scale-ups grow through execution, "
+            "market access, operator support, partner ecosystems, and capital "
+            "readiness.\n\n"
+
+            "Your task is to generate high-yield web search queries that "
+            "DISCOVER previously unknown technology companies. "
+            "Do not provide company names yourself. "
+            "The search engine must discover the companies dynamically.\n\n"
+
+            "TARGET COMPANY REQUIREMENTS:\n"
+            "1. Financial: total funding raised OR annual revenue/ARR must be "
+            "explicitly between $1,000,000 and $5,000,000 USD.\n"
+            "2. Business: the company must operate a real technology product, "
+            "software platform, SaaS, cloud platform, AI platform, data platform, "
+            "developer tool, cybersecurity platform, or fintech infrastructure.\n"
+            "3. Geography: headquarters must be outside the United States, with "
+            "minimal or no meaningful US operations.\n\n"
+
+            "QUERY DESIGN RULES:\n"
+            "- Generate distinct queries using different search strategies.\n"
+            "- At least one query must strongly target explicit funding evidence.\n"
+            "- At least one query must strongly target revenue or ARR evidence.\n"
+            "- At least one query must strongly target the technology/platform "
+            "and non-US headquarters.\n"
+            "- Prefer exact financial phrases such as '$2 million', "
+            "'$3 million', '$4 million', '$5 million', 'USD 2 million', "
+            "'USD 3 million', 'USD 4 million', 'USD 5 million', '$2M', '$3M', "
+            "'$4M', '$5M'.\n"
+            "- Include terms such as 'raised', 'funding', 'seed round', "
+            "'pre-seed', 'pre-Series A', 'annual revenue', 'ARR', or 'revenue'.\n"
+            "- Include technology terms such as 'platform', 'SaaS', 'software', "
+            "'cloud platform', 'AI platform', 'data platform', or "
+            "'cybersecurity platform'.\n"
+            "- Include geographic terms from the supplied region.\n"
+            "- Prefer company-specific evidence pages, funding announcements, "
+            "press releases, official company pages, investor announcements, "
+            "and reputable startup/company databases.\n"
+            "- Avoid queries primarily intended to find investor lists, VC lists, "
+            "directories, jobs pages, rankings, comparison pages, or generic "
+            "articles.\n"
+            "- Avoid results about individual investors rather than operating "
+            "companies.\n"
+            "- Use negative search terms when useful, such as "
+            "-investors -VC -venture -jobs -careers -directory -list.\n"
+            "- Do not rely on a single website, database, or source.\n"
+            "- Do not hardcode company names.\n"
+            "- Do not invent funding, revenue, company names, or URLs.\n"
+            "- Queries must be natural web-search strings, not questions requiring "
+            "the search engine to answer.\n"
+            "- Return ONLY valid JSON in this exact format: "
+            "{\"queries\": [\"query 1\", \"query 2\", \"query 3\"]}"
+        )
+
+        # -------------------------------------------------------------------
+        # User prompt
+        # -------------------------------------------------------------------
+
         user_prompt = (
-            f"Generate {count} distinct, high-yield web search queries for finding target companies:\n"
-            f"- Sector Theme: {selected_sector}\n"
-            f"- Geographic Region: {selected_geography}\n"
-            f"- Funding Bracket: $1M to $5M USD (Seed, Seed+, Pre-Series A)\n"
-            f"- Exclusion: Minimal to no US presence\n\n"
-            "Remember: Return ONLY valid JSON with key 'queries'."
+            f"Generate {count} distinct, high-yield discovery queries.\n\n"
+
+            f"SECTOR THEME: {selected_sector}\n"
+            f"GEOGRAPHIC REGION: {selected_geography}\n"
+            "FINANCIAL RANGE: $1M-$5M USD total funding OR annual revenue/ARR\n\n"
+
+            "Create a balanced set of queries using different approaches:\n"
+            "A. Funding-first discovery: find companies with explicit "
+            "$1M-$5M USD funding announcements.\n"
+            "B. Revenue-first discovery: find companies with explicit "
+            "$1M-$5M USD annual revenue or ARR evidence.\n"
+            "C. Platform-first discovery: find non-US technology platforms "
+            "and combine the search with funding/revenue evidence.\n\n"
+
+            "The queries should favor actual operating companies and "
+            "evidence-rich pages rather than investor lists or generic "
+            "startup articles.\n\n"
+
+            "Return ONLY valid JSON with a 'queries' array."
         )
 
         logger.info(
-            "Generating discovery queries via Groq | Model: %s | Sector: '%s' | Geography: '%s'",
+            "Generating discovery queries via Groq | "
+            "Model: %s | Sector: '%s' | Geography: '%s'",
             self.model,
             selected_sector,
             selected_geography,
         )
 
+        # -------------------------------------------------------------------
+        # Groq request
+        # -------------------------------------------------------------------
+
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
+                    {
+                        "role": "system",
+                        "content": system_prompt,
+                    },
+                    {
+                        "role": "user",
+                        "content": user_prompt,
+                    },
                 ],
-                response_format={"type": "json_object"},
+                response_format={
+                    "type": "json_object",
+                },
                 temperature=0.7,
             )
 
             raw_content = response.choices[0].message.content
+
             if not raw_content:
-                raise PlannerError("Empty response received from Groq LLM.")
+                raise PlannerError(
+                    "Empty response received from Groq LLM."
+                )
+
+            # ---------------------------------------------------------------
+            # Parse JSON
+            # ---------------------------------------------------------------
 
             parsed = json.loads(raw_content)
+
             queries = parsed.get("queries", [])
 
             if not isinstance(queries, list) or not queries:
-                raise PlannerError(f"Unexpected JSON structure from Groq: {raw_content[:200]}")
+                raise PlannerError(
+                    "Unexpected JSON structure from Groq: "
+                    f"{raw_content[:200]}"
+                )
 
+            # ---------------------------------------------------------------
             # Clean and validate queries
-            clean_queries = [str(q).strip().strip('"') for q in queries if str(q).strip()]
+            # ---------------------------------------------------------------
 
-            logger.info("Successfully generated %d search queries via Groq", len(clean_queries))
-            for i, q in enumerate(clean_queries, 1):
-                logger.info("  Generated Query [%d]: %s", i, q)
+            clean_queries: List[str] = []
+
+            for query in queries:
+                query_text = str(query).strip().strip('"')
+
+                if not query_text:
+                    continue
+
+                # Avoid accidental duplicates while preserving order.
+                if query_text not in clean_queries:
+                    clean_queries.append(query_text)
+
+            if not clean_queries:
+                raise PlannerError(
+                    "Groq returned no usable search queries."
+                )
+
+            logger.info(
+                "Successfully generated %d search queries via Groq",
+                len(clean_queries),
+            )
+
+            for index, query in enumerate(
+                clean_queries,
+                start=1,
+            ):
+                logger.info(
+                    "  Generated Query [%d]: %s",
+                    index,
+                    query,
+                )
 
             return clean_queries
 
+        # -------------------------------------------------------------------
+        # Error handling
+        # -------------------------------------------------------------------
+
         except json.JSONDecodeError as exc:
-            err_msg = f"Failed to parse JSON response from Groq: {exc}"
-            logger.error(err_msg)
-            raise PlannerError(err_msg) from exc
+            error_message = (
+                f"Failed to parse JSON response from Groq: {exc}"
+            )
+
+            logger.error(error_message)
+
+            raise PlannerError(
+                error_message
+            ) from exc
+
         except Exception as exc:
-            err_msg = f"Groq API call failed: {exc}"
-            logger.error(err_msg)
-            raise PlannerError(err_msg) from exc
+            error_message = (
+                f"Groq API call failed: {exc}"
+            )
+
+            logger.error(error_message)
+
+            raise PlannerError(
+                error_message
+            ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Standalone discovery test
+# ---------------------------------------------------------------------------
 
 
 def run_discovery_test(
@@ -230,65 +454,164 @@ def run_discovery_test(
     geography: Optional[str] = "Europe",
     max_results: int = 3,
 ) -> Dict[str, object]:
-    """Verification function demonstrating the Step 2 discovery pipeline:
+    """Run a small planner -> Tavily discovery verification.
 
-    Groq generates a query -> Tavily executes search -> Structured results returned.
+    This demonstrates:
+
+        Groq → dynamic query generation → Tavily → structured results
 
     Args:
-        sector: Target technology sector.
-        geography: Target non-US geography.
-        max_results: Number of search results to retrieve from Tavily.
+        sector:
+            Target technology sector.
+
+        geography:
+            Target non-US geography.
+
+        max_results:
+            Number of Tavily results to retrieve.
 
     Returns:
-        Dictionary containing generated queries and search results.
+        Dictionary containing test status, query, and search results.
     """
+
     print("=" * 70)
-    print("TVB Discovery Pipeline Test: Groq Query Generation -> Tavily Search")
+    print(
+        "TVB Discovery Pipeline Test: "
+        "Groq Query Generation -> Tavily Search"
+    )
     print("=" * 70)
 
-    # 1. Initialize Planner and generate dynamic query
-    print(f"\n[1] Initializing Groq Query Planner for: Sector='{sector}', Geography='{geography}'...")
+    # -----------------------------------------------------------------------
+    # 1. Initialize planner and generate dynamic queries
+    # -----------------------------------------------------------------------
+
+    print(
+        f"\n[1] Initializing Groq Query Planner for: "
+        f"Sector='{sector}', Geography='{geography}'..."
+    )
+
     planner = QueryPlanner()
 
     try:
-        queries = planner.generate_queries(sector=sector, geography=geography, count=2)
-        print(f"    Generated {len(queries)} dynamic queries successfully:")
-        for idx, q in enumerate(queries, 1):
-            print(f"      [{idx}] {q}")
-    except Exception as e:
-        print(f"    [ERROR] Groq Planner Error: {e}")
-        return {"status": "error", "step": "planner", "error": str(e)}
+        queries = planner.generate_queries(
+            sector=sector,
+            geography=geography,
+            count=2,
+        )
 
-    # 2. Execute Tavily search with the first generated query
+        print(
+            f"    Generated {len(queries)} dynamic queries successfully:"
+        )
+
+        for index, query in enumerate(
+            queries,
+            start=1,
+        ):
+            print(
+                f"      [{index}] {query}"
+            )
+
+    except Exception as exc:
+        print(
+            f"    [ERROR] Groq Planner Error: {exc}"
+        )
+
+        return {
+            "status": "error",
+            "step": "planner",
+            "error": str(exc),
+        }
+
+    # -----------------------------------------------------------------------
+    # 2. Execute Tavily search using first generated query
+    # -----------------------------------------------------------------------
+
     selected_query = queries[0]
-    print(f"\n[2] Executing Tavily Search for Query: '{selected_query}'...")
+
+    print(
+        f"\n[2] Executing Tavily Search for Query: "
+        f"'{selected_query}'..."
+    )
+
     search_service = TavilySearchService()
 
     try:
         results: List[SearchResult] = search_service.search(
-            query=selected_query, max_results=max_results
+            query=selected_query,
+            max_results=max_results,
         )
-        print(f"    Tavily search returned {len(results)} structured results:")
-        for idx, item in enumerate(results, 1):
-            print(f"\n    --- Result [{idx}] ---")
-            print(f"    Title:   {item.title}")
-            print(f"    URL:     {item.url}")
-            print(f"    Domain:  {item.domain}")
-            snippet_preview = item.content.replace("\n", " ")[:140]
-            print(f"    Snippet: {snippet_preview}...")
 
-        print("\n" + "=" * 70)
-        print("[SUCCESS] STEP 2 PIPELINE TEST COMPLETED")
-        print("=" * 70)
+        print(
+            f"    Tavily search returned "
+            f"{len(results)} structured results:"
+        )
+
+        for index, item in enumerate(
+            results,
+            start=1,
+        ):
+            print(
+                f"\n    --- Result [{index}] ---"
+            )
+
+            print(
+                f"    Title:   {item.title}"
+            )
+
+            print(
+                f"    URL:     {item.url}"
+            )
+
+            print(
+                f"    Domain:  {item.domain}"
+            )
+
+            snippet_preview = (
+                item.content
+                .replace("\n", " ")
+                [:140]
+            )
+
+            print(
+                f"    Snippet: {snippet_preview}..."
+            )
+
+        print(
+            "\n" + "=" * 70
+        )
+
+        print(
+            "[SUCCESS] STEP 2 PIPELINE TEST COMPLETED"
+        )
+
+        print(
+            "=" * 70
+        )
+
         return {
             "status": "success",
             "query": selected_query,
-            "results": [r.model_dump() for r in results],
+            "results": [
+                result.model_dump()
+                for result in results
+            ],
         }
 
-    except Exception as e:
-        print(f"    [ERROR] Tavily Search Error: {e}")
-        return {"status": "error", "step": "search", "error": str(e)}
+    except Exception as exc:
+        print(
+            f"    [ERROR] Tavily Search Error: {exc}"
+        )
+
+        return {
+            "status": "error",
+            "step": "search",
+            "error": str(exc),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Direct execution
+# ---------------------------------------------------------------------------
 
 
 if __name__ == "__main__":
