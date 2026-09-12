@@ -54,9 +54,11 @@ class LeadPipeline:
             "discovered", "researched", "qualified", "founders", "emails", "verified",
             "duplicates", "failures", "research_fetch_failures", "research_insufficient_text",
             "research_non_company", "research_extraction_failures", "duplicate_companies",
+            "research_api_failures", "research_json_failures",
             "financial_unknown", "financial_fail", "technology_unknown", "technology_fail",
             "geography_unknown", "geography_fail",
         )}
+        self.last_research_error: Optional[str] = None
 
     @staticmethod
     def _lead_key(profile: CompanyProfile) -> str:
@@ -117,6 +119,9 @@ class LeadPipeline:
             return
         for key, value in consume().items():
             self.stats[key] = self.stats.get(key, 0) + value
+        consume_last_error = getattr(self.research_service, "consume_last_research_error", None)
+        if callable(consume_last_error):
+            self.last_research_error = consume_last_error() or self.last_research_error
 
     def run(self) -> List[QualifiedLead]:
         """Discover/process until target or configured safety limits are reached."""

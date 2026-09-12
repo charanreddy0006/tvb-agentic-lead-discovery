@@ -108,7 +108,10 @@ def run_live(target: int, iterations: int, candidates: int) -> None:
         raise RuntimeError("Live mode requires GROQ_API_KEY and TAVILY_API_KEY in the local environment.")
     from agent.lead_pipeline import LeadPipeline
     pipeline = LeadPipeline(target_leads=target, max_iterations=iterations, max_candidates=candidates)
-    _save(pipeline.run(), pipeline.stats, {}, False)
+    leads = pipeline.run()
+    stats = dict(pipeline.stats)
+    stats["last_research_error"] = pipeline.last_research_error or ""
+    _save(leads, stats, {}, False)
 
 
 def render_process_overview() -> None:
@@ -264,6 +267,8 @@ else:
             "research_insufficient_text": "Insufficient research text",
             "research_non_company": "Non-company results",
             "research_extraction_failures": "Research extraction failures",
+            "research_api_failures": "Research API failures",
+            "research_json_failures": "Research JSON failures",
             "duplicate_companies": "Duplicate companies",
             "financial_unknown": "Financial UNKNOWN",
             "financial_fail": "Financial FAIL",
@@ -280,6 +285,8 @@ else:
         if diagnostics:
             st.markdown("<div class='section-title'>Run diagnostics</div><div class='section-subtitle'>Observed research and qualification outcomes from this run.</div>", unsafe_allow_html=True)
             st.dataframe(pd.DataFrame(diagnostics), width="stretch", hide_index=True)
+        if stats.get("last_research_error"):
+            st.caption(f"Last research error: {stats['last_research_error']}")
         if stats.get("failures", 0) or stats.get("duplicates", 0):
             left, right = st.columns(2)
             left.metric("Pipeline failures", stats.get("failures", 0))
