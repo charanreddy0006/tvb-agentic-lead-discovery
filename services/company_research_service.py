@@ -86,7 +86,7 @@ class CompanyResearchService:
         "llama-3.3-70b-versatile",
         "llama-3.1-8b-instant",
     ]
-    MAX_PAGE_CHARS = 6000  # Context truncation for clean, fast extraction
+    MAX_PAGE_CHARS = 4500  # Context truncation to reduce Groq token usage
     FETCH_TIMEOUT = 10.0   # HTTP request timeout per page
 
     def __init__(
@@ -401,7 +401,7 @@ class CompanyResearchService:
                 response_format={"type": "json_object"},
                 temperature=0.1,  # Low temperature for strict factual extraction
                 include_reasoning=False,
-                max_completion_tokens=900,
+                max_completion_tokens=1400,
             )
         except Exception as exc:
             self._record_research_error(exc, "research_api_failures")

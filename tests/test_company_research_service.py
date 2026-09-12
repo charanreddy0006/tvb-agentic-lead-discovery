@@ -160,7 +160,7 @@ class CompanyResearchServiceTests(unittest.TestCase):
 
         self.assertEqual(
             completions.last_kwargs["max_completion_tokens"],
-            900,
+            1400,
         )
 
         self.assertEqual(
