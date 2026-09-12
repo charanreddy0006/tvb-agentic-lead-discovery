@@ -1,7 +1,9 @@
 """Deterministic tests for source-backed company research extraction."""
 
 import json
+import os
 import unittest
+from unittest.mock import patch
 
 from core.models import SearchResult
 from services.company_research_service import CompanyResearchService
@@ -25,8 +27,10 @@ class _Response:
 class _Completions:
     def __init__(self, content: str):
         self.content = content
+        self.last_kwargs = None
 
     def create(self, **kwargs):
+        self.last_kwargs = kwargs
         return _Response(self.content)
 
 
@@ -78,6 +82,44 @@ class CompanyResearchServiceTests(unittest.TestCase):
         self.assertEqual(profile.evidence["technology"], "It sells a cloud platform.")
         self.assertEqual(profile.evidence["headquarters"], "Acme Platform is headquartered in Paris, France.")
         self.assertEqual(profile.evidence["us_operations"], "It has no US operations.")
+
+    def test_uses_20b_default_and_passes_reasoning_and_token_controls(self) -> None:
+        source = "Acme Platform is a SaaS company headquartered in Berlin, Germany."
+        with patch.dict(os.environ, {"GROQ_MODEL": ""}, clear=False):
+            service = self._service_for_payload({"is_company": True, "company_name": "Acme Platform"})
+        service._extract_from_text(source, "https://source.example", "source.example")
+        completions = service.client.chat.completions
+        self.assertEqual(service.model, "openai/gpt-oss-20b")
+        self.assertFalse(completions.last_kwargs["include_reasoning"])
+        self.assertEqual(completions.last_kwargs["max_completion_tokens"], 1400)
+        self.assertEqual(completions.last_kwargs["response_format"], {"type": "json_object"})
+
+    def test_groq_api_failure_has_separate_diagnostic(self) -> None:
+        class FailingCompletions:
+            def create(self, **kwargs):
+                error = RuntimeError("provider unavailable")
+                error.status_code = 503
+                raise error
+
+        service = CompanyResearchService(groq_api_key="test-key")
+        service.client = type("Client", (), {"chat": type("Chat", (), {"completions": FailingCompletions()})()})()
+        self.assertIsNone(service._extract_from_text("Company text", "https://source.example", "source.example"))
+        diagnostics = service.consume_diagnostics()
+        self.assertEqual(diagnostics["research_api_failures"], 1)
+        self.assertEqual(diagnostics["research_json_failures"], 0)
+        self.assertIn("503", service.consume_last_research_error() or "")
+
+    def test_json_failure_has_separate_diagnostic(self) -> None:
+        service = self._service_for_payload("not valid json")
+        self.assertIsNone(service._extract_from_text("Company text", "https://source.example", "source.example"))
+        diagnostics = service.consume_diagnostics()
+        self.assertEqual(diagnostics["research_api_failures"], 0)
+        self.assertEqual(diagnostics["research_json_failures"], 1)
+        self.assertEqual(diagnostics["research_extraction_failures"], 0)
+
+    def test_groq_model_override_still_works(self) -> None:
+        service = CompanyResearchService(groq_api_key="test-key", model="custom-model")
+        self.assertEqual(service.model, "custom-model")
 
     def test_accepts_fenced_json_with_extra_text_and_missing_evidence(self) -> None:
         source = "Acme Platform sells a SaaS platform and is headquartered in Berlin, Germany."

@@ -78,7 +78,7 @@ THIRD_PARTY_DOMAINS = {
 class CompanyResearchService:
     """Extracts structured CompanyProfile entities from search results using Groq LLM."""
 
-    DEFAULT_MODEL = "openai/gpt-oss-120b"
+    DEFAULT_MODEL = "openai/gpt-oss-20b"
     FALLBACK_MODELS = [
         "openai/gpt-oss-120b",
         "openai/gpt-oss-20b",
@@ -104,7 +104,8 @@ class CompanyResearchService:
             fetch_timeout: Timeout in seconds for fetching individual webpages.
         """
         self.groq_api_key = groq_api_key or os.getenv("GROQ_API_KEY")
-        self.model = model or os.getenv("GROQ_MODEL", self.DEFAULT_MODEL)
+        configured_model = os.getenv("GROQ_MODEL")
+        self.model = model or configured_model or self.DEFAULT_MODEL
         self.fetch_timeout = fetch_timeout
         self.client: Optional[Groq] = None
         self.max_workers = max(1, min(max_workers, 5))
@@ -118,8 +119,11 @@ class CompanyResearchService:
             "research_non_company": 0,
             "research_extraction_failures": 0,
             "duplicate_companies": 0,
+            "research_api_failures": 0,
+            "research_json_failures": 0,
         }
         self._diagnostics_lock = threading.Lock()
+        self._last_research_error: Optional[str] = None
 
         if not self.groq_api_key or self.groq_api_key.strip() in ("", "your_groq_api_key_here"):
             logger.warning(
@@ -155,6 +159,20 @@ class CompanyResearchService:
             for key in self._diagnostics:
                 self._diagnostics[key] = 0
         return diagnostics
+
+    def consume_last_research_error(self) -> Optional[str]:
+        with self._diagnostics_lock:
+            error = self._last_research_error
+            self._last_research_error = None
+        return error
+
+    def _record_research_error(self, exc: Exception, diagnostic: str) -> None:
+        status = getattr(exc, "status_code", None)
+        status_text = f" HTTP {status}" if status is not None else ""
+        message = " ".join(str(exc).split())[:300] or exc.__class__.__name__
+        with self._diagnostics_lock:
+            self._diagnostics[diagnostic] += 1
+            self._last_research_error = f"{exc.__class__.__name__}{status_text}: {message}"
 
     def fetch_webpage_text(self, url: str) -> Optional[str]:
         """Fetch and clean readable text from a webpage.
@@ -380,14 +398,29 @@ class CompanyResearchService:
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.1,  # Low temperature for strict factual extraction
+                include_reasoning=False,
+                max_completion_tokens=1400,
             )
+        except Exception as exc:
+            self._record_research_error(exc, "research_api_failures")
+            logger.warning(
+                "Research model API failed | URL: %s | %s",
+                source_url,
+                self._last_research_error,
+            )
+            return None
 
+        try:
             raw = response.choices[0].message.content
             if not raw:
-                logger.warning("Empty response received from LLM for URL: %s", source_url)
-                return None
-
+                raise ValueError("Model returned empty extraction output.")
             data = self._parse_json_object(raw)
+        except (ValueError, json.JSONDecodeError) as exc:
+            self._record_research_error(exc, "research_json_failures")
+            logger.warning("Research JSON parsing failed | URL: %s | %s", source_url, str(exc)[:300])
+            return None
+
+        try:
 
             if not data.get("is_company", True):
                 self._increment_diagnostic("research_non_company")
