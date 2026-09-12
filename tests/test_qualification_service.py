@@ -61,6 +61,42 @@ class QualificationServiceTests(unittest.TestCase):
         self.assertFalse(result.is_qualified)
         self.assertEqual(result.is_financially_qualified, ValidationStatus.UNKNOWN)
 
+    def test_explicit_usd_total_funding_formats(self) -> None:
+        for evidence in (
+            "The company raised $2M total.",
+            "The company raised USD 2M total.",
+            "The company raised 2M USD total.",
+            "The company raised US$2M total.",
+            "The company raised $2 million total.",
+            "The company raised USD 2 million total.",
+        ):
+            assessment = self.service.validate_financials(profile(evidence={"funding": evidence, "location": "Paris, France-based."}))
+            self.assertEqual(assessment.status, ValidationStatus.PASS, evidence)
+            self.assertEqual(assessment.currency, "USD", evidence)
+
+    def test_technology_and_geography_use_preserved_evidence(self) -> None:
+        candidate = profile(
+            description="A business company",
+            industry="Operations",
+            location=None,
+            evidence={
+                "funding": "Raised $2M.",
+                "technology": "The company sells a cloud platform for data teams.",
+                "headquarters": "Headquartered in Paris, France.",
+                "us_operations": "No US operations are stated.",
+            },
+        )
+        self.assertEqual(self.service.validate_technology(candidate)[0], ValidationStatus.PASS)
+        self.assertEqual(self.service.validate_geography(candidate)[0], ValidationStatus.PASS)
+
+    def test_us_operations_evidence_fails_geography(self) -> None:
+        candidate = profile(evidence={
+            "funding": "Raised $2M.",
+            "headquarters": "Headquartered in Paris, France.",
+            "us_operations": "The company has a major US office in Boston, USA.",
+        })
+        self.assertEqual(self.service.validate_geography(candidate)[0], ValidationStatus.FAIL)
+
 
 if __name__ == "__main__":
     unittest.main()

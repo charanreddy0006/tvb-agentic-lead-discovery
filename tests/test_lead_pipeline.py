@@ -114,6 +114,31 @@ class LeadPipelineTests(unittest.TestCase):
         self.assertEqual([result.title for result in results], ["first", "second"])
         self.assertEqual(pipeline.stats["failures"], 1)
 
+    def test_research_and_gate_diagnostics_are_recorded(self):
+        class DiagnosticResearch:
+            def research_candidates(self, results):
+                return [profile(qualified=False)]
+
+            def consume_diagnostics(self):
+                return {
+                    "research_fetch_failures": 2,
+                    "research_insufficient_text": 1,
+                    "research_non_company": 3,
+                    "research_extraction_failures": 4,
+                    "duplicate_companies": 1,
+                }
+
+        pipeline = LeadPipeline(
+            target_leads=1, max_iterations=1, max_candidates=5, planner=Planner(),
+            search_service=Search(), research_service=DiagnosticResearch(),
+            founder_service=Founder(), email_service=Email(), verification_service=Verify(),
+        )
+        self.assertEqual(pipeline.run(), [])
+        self.assertEqual(pipeline.stats["research_non_company"], 3)
+        self.assertEqual(pipeline.stats["research_extraction_failures"], 4)
+        self.assertEqual(pipeline.stats["financial_unknown"], 1)
+        self.assertEqual(pipeline.stats["technology_unknown"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

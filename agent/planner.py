@@ -160,8 +160,11 @@ class QueryPlanner:
             "3. Location: Strictly NON-US based (UK, Europe, India, Southeast Asia, MENA, LATAM, etc.).\n\n"
             "CRITICAL RULES:\n"
             "- Do NOT output or name specific known companies.\n"
-            "- Generate search engine queries designed to find recent funding announcements, "
-            "press releases, startup directories, or seed rounds matching this profile.\n"
+            "- Prioritize evidence-rich funding announcements, investor or company press releases, "
+            "and official company pages that state exact USD funding of $1M-$5M or annual revenue/ARR "
+            "of $1M-$5M.\n"
+            "- Prefer sources that explicitly state headquarters, technology platform/product details, "
+            "and any US operational presence.\n"
             "- Use search operators where effective (e.g. quotes, OR, site: filters, exclusion -USA).\n"
             "- Output valid JSON ONLY in this exact format: {\"queries\": [\"query 1\", \"query 2\", ...]}"
         )

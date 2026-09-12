@@ -103,10 +103,15 @@ class QualificationService:
         """Find an explicitly stated total funding amount, never a selected historical round."""
         if not evidence:
             return None
-        money = r"(?P<symbol>\$|EUR\s*|GBP\s*)?(?P<amount>\d+(?:\.\d+)?)\s*(?P<unit>[mMbBkK]|million|billion|thousand)?"
+        money = (
+            r"(?P<prefix>US\$|\$|USD|EUR|GBP|€|£)?\s*"
+            r"(?P<amount>\d+(?:\.\d+)?)\s*"
+            r"(?P<unit>[mMbBkK]|million|billion|thousand)?\s*"
+            r"(?P<suffix>USD|EUR|GBP)?"
+        )
         patterns = (
-            rf"(?:raised|total funding|total raised)[^.$]{{0,40}}{money}[^.]*\btotal\b",
-            rf"\btotal (?:funding|raised)[^.$]{{0,40}}{money}",
+            rf"(?:raised|total funding|total raised)\b[^.\n]{{0,40}}?{money}[^.\n]{{0,20}}\btotal\b",
+            rf"\btotal (?:funding|raised)\b[^.\n]{{0,40}}?{money}",
         )
         for pattern in patterns:
             match = re.search(pattern, evidence, re.I)
@@ -115,8 +120,13 @@ class QualificationService:
             raw_amount = float(match.group("amount"))
             unit = (match.group("unit") or "").lower()
             multiplier = 1_000_000 if unit in {"m", "million"} else 1_000_000_000 if unit in {"b", "billion"} else 1_000 if unit in {"k", "thousand"} else 1
-            symbol = (match.group("symbol") or "").strip().upper()
-            currency = "USD" if symbol == "$" else symbol or ""
+            currency_tokens = {
+                (match.group("prefix") or "").strip().upper(),
+                (match.group("suffix") or "").strip().upper(),
+            }
+            currency = "USD" if currency_tokens & {"US$", "$", "USD"} else next(
+                (token for token in ("EUR", "GBP") if token in currency_tokens), ""
+            )
             return raw_amount * multiplier, currency
         return None
 
@@ -166,15 +176,18 @@ class QualificationService:
 
     def validate_geography(self, profile: CompanyProfile) -> Tuple[ValidationStatus, Optional[str], Optional[str]]:
         """Pass a known non-US HQ only when no significant US operations are evidenced."""
-        location_evidence = profile.evidence.get("location") or profile.location
-        if not self._has_text(location_evidence):
+        headquarters_evidence = profile.evidence.get("headquarters") or profile.evidence.get("location") or profile.location
+        us_operations_evidence = profile.evidence.get("us_operations")
+        if not self._has_text(headquarters_evidence) and not self._has_text(us_operations_evidence):
             return ValidationStatus.UNKNOWN, None, "Insufficient geographic evidence."
-        text = location_evidence.lower()
-        if any(re.search(pattern, text, re.I) for pattern in US_OPERATION_PATTERNS):
-            return ValidationStatus.FAIL, location_evidence, "Significant US operational presence detected."
-        if any(re.search(pattern, text, re.I) for pattern in NON_US_LOCATION_PATTERNS):
-            return ValidationStatus.PASS, location_evidence, None
-        return ValidationStatus.UNKNOWN, location_evidence, "Geographic evidence does not establish a non-US headquarters."
+        headquarters_text = (headquarters_evidence or "").lower()
+        us_operations_text = (us_operations_evidence or "").lower()
+        combined_evidence = " | ".join(value for value in (headquarters_evidence, us_operations_evidence) if value)
+        if any(re.search(pattern, text, re.I) for text in (headquarters_text, us_operations_text) for pattern in US_OPERATION_PATTERNS):
+            return ValidationStatus.FAIL, combined_evidence, "Significant US operational presence detected."
+        if any(re.search(pattern, headquarters_text, re.I) for pattern in NON_US_LOCATION_PATTERNS):
+            return ValidationStatus.PASS, combined_evidence, None
+        return ValidationStatus.UNKNOWN, combined_evidence, "Geographic evidence does not establish a non-US headquarters."
 
     @staticmethod
     def _source_warnings(profile: CompanyProfile) -> List[str]:

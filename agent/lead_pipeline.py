@@ -50,7 +50,13 @@ class LeadPipeline:
         self.founder_service = founder_service or FounderDiscoveryService(search_service=self.search_service)
         self.email_service = email_service or EmailDiscoveryService(search_service=self.search_service)
         self.verification_service = verification_service or EmailVerificationService()
-        self.stats: Dict[str, int] = {key: 0 for key in ("discovered", "researched", "qualified", "founders", "emails", "verified", "duplicates", "failures")}
+        self.stats: Dict[str, int] = {key: 0 for key in (
+            "discovered", "researched", "qualified", "founders", "emails", "verified",
+            "duplicates", "failures", "research_fetch_failures", "research_insufficient_text",
+            "research_non_company", "research_extraction_failures", "duplicate_companies",
+            "financial_unknown", "financial_fail", "technology_unknown", "technology_fail",
+            "geography_unknown", "geography_fail",
+        )}
 
     @staticmethod
     def _lead_key(profile: CompanyProfile) -> str:
@@ -105,6 +111,13 @@ class LeadPipeline:
                     self.stats["failures"] += 1
         return search_results
 
+    def _merge_research_diagnostics(self) -> None:
+        consume = getattr(self.research_service, "consume_diagnostics", None)
+        if not callable(consume):
+            return
+        for key, value in consume().items():
+            self.stats[key] = self.stats.get(key, 0) + value
+
     def run(self) -> List[QualifiedLead]:
         """Discover/process until target or configured safety limits are reached."""
         leads: List[QualifiedLead] = []
@@ -124,15 +137,25 @@ class LeadPipeline:
                 profiles = self.research_service.research_candidates(search_results[:remaining_capacity])
             except Exception as exc:
                 self.stats["failures"] += 1; logger.warning("Iteration %d research failed: %s", iteration, exc); continue
+            self._merge_research_diagnostics()
             for company in profiles:
                 if len(leads) >= self.target_leads or self.stats["researched"] >= self.max_candidates:
                     break
                 company_key = self._lead_key(company)
                 if company_key in seen_companies:
-                    self.stats["duplicates"] += 1; continue
+                    self.stats["duplicates"] += 1
+                    self.stats["duplicate_companies"] += 1
+                    continue
                 seen_companies.add(company_key); self.stats["researched"] += 1
                 try:
                     qualification = self.qualification_service.qualify_profile(company)
+                    for name, status in (
+                        ("financial", qualification.is_financially_qualified),
+                        ("technology", qualification.is_technology_qualified),
+                        ("geography", qualification.is_geographically_qualified),
+                    ):
+                        if status.value in {"UNKNOWN", "FAIL"}:
+                            self.stats[f"{name}_{status.value.lower()}"] += 1
                     if not qualification.is_qualified:
                         continue
                     self.stats["qualified"] += 1

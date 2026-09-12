@@ -259,6 +259,27 @@ else:
             st.dataframe(rejection_table, width="stretch", hide_index=True)
         else:
             st.info("Detailed rejection categories were not returned for this run.")
+        diagnostic_labels = {
+            "research_fetch_failures": "Research fetch failures",
+            "research_insufficient_text": "Insufficient research text",
+            "research_non_company": "Non-company results",
+            "research_extraction_failures": "Research extraction failures",
+            "duplicate_companies": "Duplicate companies",
+            "financial_unknown": "Financial UNKNOWN",
+            "financial_fail": "Financial FAIL",
+            "technology_unknown": "Technology UNKNOWN",
+            "technology_fail": "Technology FAIL",
+            "geography_unknown": "Geography UNKNOWN",
+            "geography_fail": "Geography FAIL",
+        }
+        diagnostics = [
+            {"Diagnostic": label, "Count": stats.get(key, 0)}
+            for key, label in diagnostic_labels.items()
+            if stats.get(key, 0)
+        ]
+        if diagnostics:
+            st.markdown("<div class='section-title'>Run diagnostics</div><div class='section-subtitle'>Observed research and qualification outcomes from this run.</div>", unsafe_allow_html=True)
+            st.dataframe(pd.DataFrame(diagnostics), width="stretch", hide_index=True)
         if stats.get("failures", 0) or stats.get("duplicates", 0):
             left, right = st.columns(2)
             left.metric("Pipeline failures", stats.get("failures", 0))

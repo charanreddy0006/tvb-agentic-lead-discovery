@@ -112,6 +112,14 @@ class CompanyResearchService:
         self._http_client_lock = threading.Lock()
         self._page_cache: Dict[str, Optional[str]] = {}
         self._page_cache_lock = threading.Lock()
+        self._diagnostics = {
+            "research_fetch_failures": 0,
+            "research_insufficient_text": 0,
+            "research_non_company": 0,
+            "research_extraction_failures": 0,
+            "duplicate_companies": 0,
+        }
+        self._diagnostics_lock = threading.Lock()
 
         if not self.groq_api_key or self.groq_api_key.strip() in ("", "your_groq_api_key_here"):
             logger.warning(
@@ -135,6 +143,18 @@ class CompanyResearchService:
                 self.client = Groq(api_key=self.groq_api_key, timeout=25.0)
             except Exception as e:
                 raise CompanyResearchError(f"Could not connect to Groq client: {e}") from e
+
+    def _increment_diagnostic(self, key: str) -> None:
+        with self._diagnostics_lock:
+            self._diagnostics[key] += 1
+
+    def consume_diagnostics(self) -> Dict[str, int]:
+        """Return and reset research diagnostics for the latest batch."""
+        with self._diagnostics_lock:
+            diagnostics = dict(self._diagnostics)
+            for key in self._diagnostics:
+                self._diagnostics[key] = 0
+        return diagnostics
 
     def fetch_webpage_text(self, url: str) -> Optional[str]:
         """Fetch and clean readable text from a webpage.
@@ -169,6 +189,7 @@ class CompanyResearchService:
             resp = http_client.get(url, headers=headers)
 
             if resp.status_code != 200:
+                self._increment_diagnostic("research_fetch_failures")
                 logger.warning(
                     "Page fetch failed (HTTP %d) | URL: %s", resp.status_code, url
                 )
@@ -202,16 +223,19 @@ class CompanyResearchService:
             return truncated_text
 
         except httpx.TimeoutException:
+            self._increment_diagnostic("research_fetch_failures")
             logger.warning("Page fetch timed out after %.1fs | URL: %s", self.fetch_timeout, url)
             with self._page_cache_lock:
                 self._page_cache[url] = None
             return None
         except httpx.RequestError as exc:
+            self._increment_diagnostic("research_fetch_failures")
             logger.warning("Page fetch network error: %s | URL: %s", exc, url)
             with self._page_cache_lock:
                 self._page_cache[url] = None
             return None
         except Exception as exc:
+            self._increment_diagnostic("research_fetch_failures")
             logger.warning("Unexpected error fetching page: %s | URL: %s", exc, url)
             with self._page_cache_lock:
                 self._page_cache[url] = None
@@ -294,7 +318,8 @@ class CompanyResearchService:
             "   - Extract website ONLY when the text explicitly provides the company's official domain or URL. "
             "If not found, return null. Do NOT derive a website from the company name or use the source/news/directory URL.\n"
             "6. EVIDENCE: In the 'evidence' object, include VERBATIM excerpts from the text supporting "
-            "funding, revenue, and location claims.\n"
+            "funding, revenue, technology product/platform, headquarters, location, and US operations claims. "
+            "Use null when a claim is not explicitly stated.\n"
             "7. NON-COMPANY FILTER: If the text is a generic report, list of 50 tools, or does not focus "
             "on a specific commercial company, set 'is_company' to false.\n\n"
             "Return valid JSON ONLY matching this schema:\n"
@@ -313,7 +338,10 @@ class CompanyResearchService:
             '  "evidence": {\n'
             '    "funding": "verbatim quote or null",\n'
             '    "revenue": "verbatim quote or null",\n'
-            '    "location": "verbatim quote or null"\n'
+            '    "technology": "verbatim quote or null",\n'
+            '    "headquarters": "verbatim quote or null",\n'
+            '    "location": "verbatim quote or null",\n'
+            '    "us_operations": "verbatim quote or null"\n'
             "  }\n"
             "}"
         )
@@ -339,11 +367,13 @@ class CompanyResearchService:
             data = json.loads(raw)
 
             if not data.get("is_company", True):
+                self._increment_diagnostic("research_non_company")
                 logger.info("Page evaluated as not describing a primary company | URL: %s", source_url)
                 return None
 
             company_name = data.get("company_name")
             if not company_name or str(company_name).strip().lower() in ("null", "none", ""):
+                self._increment_diagnostic("research_extraction_failures")
                 logger.info("No clear company name could be extracted | URL: %s", source_url)
                 return None
 
@@ -389,6 +419,7 @@ class CompanyResearchService:
             # Trust the original funding excerpt—not an inferred/default LLM currency.
             # This deliberately leaves currency null when the evidence has no explicit marker.
             funding_currency = self._currency_from_evidence(clean_evidence.get("funding"))
+            revenue_currency = self._currency_from_evidence(clean_evidence.get("revenue"))
 
             profile = CompanyProfile(
                 company_name=company_name,
@@ -400,7 +431,7 @@ class CompanyResearchService:
                 funding_currency=funding_currency,
                 funding_stage=data.get("funding_stage"),
                 revenue_amount=revenue_amt,
-                revenue_currency=data.get("revenue_currency"),
+                revenue_currency=revenue_currency,
                 source_urls=[source_url],
                 evidence=clean_evidence,
             )
@@ -415,6 +446,7 @@ class CompanyResearchService:
             return profile
 
         except Exception as e:
+            self._increment_diagnostic("research_extraction_failures")
             logger.error("LLM profile extraction failed for URL '%s': %s", source_url, e)
             return None
 
@@ -434,6 +466,7 @@ class CompanyResearchService:
                 logger.info("Using search snippet as fallback content for: %s", result.url)
                 page_text = f"Title: {result.title}\n\nSnippet: {result.content}"
             else:
+                self._increment_diagnostic("research_insufficient_text")
                 logger.warning("Insufficient text content for analysis | URL: %s", result.url)
                 return None
 
@@ -478,6 +511,7 @@ class CompanyResearchService:
             dedup_key = profile.get_dedup_key()
 
             if dedup_key in dedup_store:
+                self._increment_diagnostic("duplicate_companies")
                 existing = dedup_store[dedup_key]
                 logger.info(
                     "Duplicate company detected ('%s' -> key: %s). Merging evidence and sources.",
