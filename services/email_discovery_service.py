@@ -35,18 +35,21 @@ GENERIC_LOCAL_PARTS = {"info", "support", "sales", "hello", "contact", "team", "
 class EmailDiscoveryService:
     """Discovers only emails explicitly attributed to a qualified founder or CEO."""
 
-    DEFAULT_MODEL = "openai/gpt-oss-120b"
+    DEFAULT_MODEL = "openai/gpt-oss-20b"
 
     def __init__(self, groq_api_key: Optional[str] = None, model: Optional[str] = None,
                  search_service: Optional[TavilySearchService] = None,
                  page_fetcher: Optional[Callable[[str], Optional[str]]] = None,
-                 max_workers: int = 3) -> None:
+                 max_workers: int = 1) -> None:
         self.groq_api_key = groq_api_key or os.getenv("GROQ_API_KEY")
-        self.model = model or os.getenv("GROQ_MODEL", self.DEFAULT_MODEL)
+        configured_model = os.getenv("GROQ_MODEL")
+        self.model = model or configured_model or self.DEFAULT_MODEL
         self.search_service = search_service or TavilySearchService()
         self.page_fetcher = page_fetcher or CompanyResearchService().fetch_webpage_text
         self.max_workers = max(1, min(max_workers, 4))
-        self.max_extraction_workers = min(self.max_workers, 3)
+        # Keep Groq extraction sequential to stay within the current
+        # Groq TPM limit. Search/fetch are also bounded by max_workers.
+        self.max_extraction_workers = 1
         self.client: Optional[Groq] = None
         if self.groq_api_key and self.groq_api_key.strip() not in ("", "your_groq_api_key_here"):
             self.client = Groq(api_key=self.groq_api_key, timeout=25.0)
@@ -109,25 +112,108 @@ class EmailDiscoveryService:
                               evidence=evidence, source_type=self._source_type(url, company),
                               discovery_status=EmailDiscoveryStatus.FOUND, confidence=confidence)
 
+    @staticmethod
+    def _explicit_emails(source: str) -> List[str]:
+        """Return unique email addresses that are literally present in source."""
+        seen = set()
+        emails: List[str] = []
+        for match in EMAIL_PATTERN.findall(source or ""):
+            email = match.strip().lower()
+            if email not in seen:
+                seen.add(email)
+                emails.append(email)
+        return emails
+
+    @staticmethod
+    def _relevant_excerpt(source: str, founder_name: str, max_chars: int = 2500) -> str:
+        """Keep a compact source window around the founder/email evidence."""
+        text = " ".join((source or "").split())
+        if len(text) <= max_chars:
+            return text
+
+        lower = text.lower()
+        positions = [match.start() for match in EMAIL_PATTERN.finditer(text)]
+
+        if founder_name:
+            founder_pos = lower.find(founder_name.lower())
+            if founder_pos >= 0:
+                positions.append(founder_pos)
+
+        if not positions:
+            return text[:max_chars]
+
+        center = min(positions)
+        start = max(0, center - max_chars // 2)
+        end = min(len(text), start + max_chars)
+        return text[start:end]
+
     def _extract_candidates(self, source: str, url: str, company: CompanyProfile,
                             founder: FounderProfile) -> List[EmailCandidate]:
+        # Never call the LLM when the source contains no explicit email.
+        # This saves Groq tokens and prevents inferred/guessed addresses.
+        explicit_emails = self._explicit_emails(source)
+        if not explicit_emails:
+            return []
+
         self._validate_client()
         assert self.client is not None
+
         prompt = (
-            "Extract only email addresses explicitly present in the supplied content. Never construct, infer, "
-            "guess, normalize into a new address, or complete a missing email address. Return only email addresses "
-            "that the source explicitly associates with the named founder at the named company. Return JSON: "
-            '{"candidates": [{"email": "string", "evidence": "verbatim source excerpt"}]}. '
-            "Use an empty list if none qualify."
+            "Extract only an email address explicitly present in the supplied content. "
+            "The exact email must be explicitly associated with the named founder. "
+            "Never construct, infer, guess, normalize, complete, or invent an address. "
+            "If there is no explicit founder-email association, return an empty list. "
+            'Return JSON only: {"candidates":[{"email":"string","evidence":"verbatim source excerpt"}]}.'
         )
+
+        excerpt = self._relevant_excerpt(source, founder.founder_name or "")
+
         response = self.client.chat.completions.create(
-            model=self.model, messages=[{"role": "system", "content": prompt}, {"role": "user", "content": f"Company: {company.company_name}\nFounder: {founder.founder_name}\n\nSource: {source}"}],
-            response_format={"type": "json_object"}, temperature=0.0,
+            model=self.model,
+            messages=[
+                {"role": "system", "content": prompt},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Company: {company.company_name}\n"
+                        f"Founder: {founder.founder_name}\n"
+                        f"Explicit emails in source: {', '.join(explicit_emails)}\n"
+                        f"Source URL: {url}\n\n"
+                        f"Source excerpt:\n{excerpt}"
+                    ),
+                },
+            ],
+            response_format={"type": "json_object"},
+            include_reasoning=False,
+            max_completion_tokens=500,
+            temperature=0.0,
         )
+
         raw = response.choices[0].message.content
-        payload = json.loads(raw or "{}")
-        return [candidate for item in payload.get("candidates", []) if isinstance(item, dict)
-                if (candidate := self._candidate_from_data(item, source, url, company, founder))]
+        try:
+            payload = json.loads(raw or "{}")
+        except (TypeError, json.JSONDecodeError):
+            logger.warning("Email extraction returned invalid JSON | Source: %s", url)
+            return []
+
+        if not isinstance(payload, dict):
+            return []
+
+        candidates: List[EmailCandidate] = []
+        items = payload.get("candidates", [])
+        if not isinstance(items, list):
+            return []
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            candidate = self._candidate_from_data(
+                item, source, url, company, founder
+            )
+            if candidate:
+                candidates.append(candidate)
+
+        return candidates
 
     @staticmethod
     def _select(candidates: List[EmailCandidate], company: CompanyProfile) -> Optional[EmailCandidate]:
@@ -175,22 +261,35 @@ class EmailDiscoveryService:
         return [(result, source) for result, source in fetched if source]
 
     def _extract_sources(
-        self, sources: List[tuple[SearchResult, str]], company: CompanyProfile, founder: FounderProfile
+        self,
+        sources: List[tuple[SearchResult, str]],
+        company: CompanyProfile,
+        founder: FounderProfile,
     ) -> tuple[List[EmailCandidate], int]:
-        def extract(item: tuple[SearchResult, str]) -> List[EmailCandidate]:
-            result, source = item
-            return self._extract_candidates(source, result.url, company, founder)
-
+        """Extract sequentially and only from sources containing explicit emails."""
         candidates: List[EmailCandidate] = []
         errors = 0
-        with ThreadPoolExecutor(max_workers=min(self.max_extraction_workers, max(1, len(sources)))) as executor:
-            futures = [executor.submit(extract, item) for item in sources]
-            for (result, _), future in zip(sources, futures):
-                try:
-                    candidates.extend(future.result())
-                except Exception as exc:
-                    errors += 1
-                    logger.warning("Email extraction failed | Source: %s | Error: %s", result.url, exc)
+
+        eligible_sources = [
+            item for item in sources
+            if self._explicit_emails(item[1])
+        ]
+
+        for result, source in eligible_sources:
+            try:
+                candidates.extend(
+                    self._extract_candidates(
+                        source, result.url, company, founder
+                    )
+                )
+            except Exception as exc:
+                errors += 1
+                logger.warning(
+                    "Email extraction failed | Source: %s | Error: %s",
+                    result.url,
+                    exc,
+                )
+
         return candidates, errors
 
     def discover_email(self, company: CompanyProfile, founder: FounderProfile) -> EmailCandidate:
