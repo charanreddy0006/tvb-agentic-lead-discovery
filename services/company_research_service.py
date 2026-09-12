@@ -94,7 +94,7 @@ class CompanyResearchService:
         groq_api_key: Optional[str] = None,
         model: Optional[str] = None,
         fetch_timeout: float = FETCH_TIMEOUT,
-        max_workers: int = 4,
+        max_workers: int = 1,
     ):
         """Initialize the Company Research Service.
 
@@ -108,6 +108,8 @@ class CompanyResearchService:
         self.model = model or configured_model or self.DEFAULT_MODEL
         self.fetch_timeout = fetch_timeout
         self.client: Optional[Groq] = None
+        # Keep research/Groq calls sequential by default to stay within Groq TPM limits.
+        # The parameter remains configurable for controlled testing, but the default is 1.
         self.max_workers = max(1, min(max_workers, 5))
         self._http_client: Optional[httpx.Client] = None
         self._http_client_lock = threading.Lock()
@@ -399,7 +401,7 @@ class CompanyResearchService:
                 response_format={"type": "json_object"},
                 temperature=0.1,  # Low temperature for strict factual extraction
                 include_reasoning=False,
-                max_completion_tokens=1400,
+                max_completion_tokens=900,
             )
         except Exception as exc:
             self._record_research_error(exc, "research_api_failures")
