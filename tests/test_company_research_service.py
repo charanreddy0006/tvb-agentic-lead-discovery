@@ -36,6 +36,11 @@ class _Client:
 
 
 class CompanyResearchServiceTests(unittest.TestCase):
+    def _service_for_payload(self, payload: object) -> CompanyResearchService:
+        service = CompanyResearchService(groq_api_key="test-key")
+        service.client = _Client(payload if isinstance(payload, str) else json.dumps(payload))
+        return service
+
     def test_preserves_source_backed_evidence_and_validates_revenue_currency(self) -> None:
         source = (
             "Acme Platform raised USD 2 million total. It sells a cloud platform. "
@@ -73,6 +78,44 @@ class CompanyResearchServiceTests(unittest.TestCase):
         self.assertEqual(profile.evidence["technology"], "It sells a cloud platform.")
         self.assertEqual(profile.evidence["headquarters"], "Acme Platform is headquartered in Paris, France.")
         self.assertEqual(profile.evidence["us_operations"], "It has no US operations.")
+
+    def test_accepts_fenced_json_with_extra_text_and_missing_evidence(self) -> None:
+        source = "Acme Platform sells a SaaS platform and is headquartered in Berlin, Germany."
+        payload = {
+            "is_company": True,
+            "company_name": "Acme Platform",
+            "description": "SaaS platform",
+            "industry": "Software",
+            "location": "Berlin, Germany",
+            "funding_amount": None,
+            "funding_currency": None,
+            "revenue_amount": None,
+            "revenue_currency": None,
+            "evidence": {
+                "funding": None,
+                "revenue": None,
+                "technology": "Acme Platform sells a SaaS platform",
+                "headquarters": "headquartered in Berlin, Germany",
+                "location": "headquartered in Berlin, Germany",
+                "us_operations": None,
+            },
+        }
+        fenced = "The structured result is below:\n```json\n" + json.dumps(payload) + "\n```\nEnd."
+        profile = self._service_for_payload(fenced)._extract_from_text(source, "https://source.example", "source.example")
+
+        self.assertIsNotNone(profile)
+        assert profile is not None
+        self.assertEqual(profile.company_name, "Acme Platform")
+        self.assertNotIn("funding", profile.evidence)
+        self.assertEqual(profile.evidence["technology"], "Acme Platform sells a SaaS platform")
+
+    def test_missing_evidence_object_does_not_fail_company_extraction(self) -> None:
+        source = "Acme Platform is a SaaS company headquartered in Berlin, Germany."
+        payload = {"is_company": True, "company_name": "Acme Platform", "description": "SaaS company"}
+        profile = self._service_for_payload(payload)._extract_from_text(source, "https://source.example", "source.example")
+        self.assertIsNotNone(profile)
+        assert profile is not None
+        self.assertEqual(profile.evidence, {})
 
     def test_non_company_extraction_increments_diagnostic(self) -> None:
         service = CompanyResearchService(groq_api_key="test-key")

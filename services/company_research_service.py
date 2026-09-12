@@ -281,6 +281,29 @@ class CompanyResearchService:
             hostname = hostname[4:]
         return bool(hostname and hostname in source_text.lower())
 
+    @staticmethod
+    def _parse_json_object(raw_content: object) -> Dict[str, object]:
+        """Parse a JSON object from plain, fenced, or prose-wrapped model output."""
+        if not isinstance(raw_content, str) or not raw_content.strip():
+            raise ValueError("Model returned empty or non-text extraction output.")
+
+        candidate = raw_content.strip()
+        fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", candidate, re.IGNORECASE | re.DOTALL)
+        if fenced:
+            candidate = fenced.group(1)
+
+        decoder = json.JSONDecoder()
+        for start, character in enumerate(candidate):
+            if character != "{":
+                continue
+            try:
+                parsed, _ = decoder.raw_decode(candidate[start:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        raise ValueError("Model output did not contain a valid JSON object.")
+
     def _extract_from_text(
         self, text: str, source_url: str, fallback_domain: str
     ) -> Optional[CompanyProfile]:
@@ -364,7 +387,7 @@ class CompanyResearchService:
                 logger.warning("Empty response received from LLM for URL: %s", source_url)
                 return None
 
-            data = json.loads(raw)
+            data = self._parse_json_object(raw)
 
             if not data.get("is_company", True):
                 self._increment_diagnostic("research_non_company")
@@ -408,6 +431,8 @@ class CompanyResearchService:
 
             # Clean evidence dict
             raw_evidence = data.get("evidence", {}) or {}
+            if not isinstance(raw_evidence, dict):
+                raw_evidence = {}
             clean_evidence = {
                 k: str(v).strip()
                 for k, v in raw_evidence.items()
