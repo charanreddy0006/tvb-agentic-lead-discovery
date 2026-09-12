@@ -9,6 +9,8 @@ import logging
 import os
 import re
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
@@ -92,6 +94,7 @@ class CompanyResearchService:
         groq_api_key: Optional[str] = None,
         model: Optional[str] = None,
         fetch_timeout: float = FETCH_TIMEOUT,
+        max_workers: int = 4,
     ):
         """Initialize the Company Research Service.
 
@@ -104,6 +107,11 @@ class CompanyResearchService:
         self.model = model or os.getenv("GROQ_MODEL", self.DEFAULT_MODEL)
         self.fetch_timeout = fetch_timeout
         self.client: Optional[Groq] = None
+        self.max_workers = max(1, min(max_workers, 5))
+        self._http_client: Optional[httpx.Client] = None
+        self._http_client_lock = threading.Lock()
+        self._page_cache: Dict[str, Optional[str]] = {}
+        self._page_cache_lock = threading.Lock()
 
         if not self.groq_api_key or self.groq_api_key.strip() in ("", "your_groq_api_key_here"):
             logger.warning(
@@ -137,6 +145,10 @@ class CompanyResearchService:
         Returns:
             Clean text content truncated to MAX_PAGE_CHARS, or None if fetch fails.
         """
+        with self._page_cache_lock:
+            if url in self._page_cache:
+                return self._page_cache[url]
+
         logger.info("Fetching webpage content | URL: %s", url)
 
         headers = {
@@ -150,13 +162,18 @@ class CompanyResearchService:
         }
 
         try:
-            with httpx.Client(timeout=self.fetch_timeout, follow_redirects=True) as http_client:
-                resp = http_client.get(url, headers=headers)
+            with self._http_client_lock:
+                if self._http_client is None:
+                    self._http_client = httpx.Client(timeout=self.fetch_timeout, follow_redirects=True)
+                http_client = self._http_client
+            resp = http_client.get(url, headers=headers)
 
             if resp.status_code != 200:
                 logger.warning(
                     "Page fetch failed (HTTP %d) | URL: %s", resp.status_code, url
                 )
+                with self._page_cache_lock:
+                    self._page_cache[url] = None
                 return None
 
             soup = BeautifulSoup(resp.text, "html.parser")
@@ -170,6 +187,8 @@ class CompanyResearchService:
 
             if len(clean_text) < 100:
                 logger.warning("Page returned minimal useful text (<100 chars) | URL: %s", url)
+                with self._page_cache_lock:
+                    self._page_cache[url] = None
                 return None
 
             truncated_text = clean_text[: self.MAX_PAGE_CHARS]
@@ -178,16 +197,24 @@ class CompanyResearchService:
                 url,
                 len(truncated_text),
             )
+            with self._page_cache_lock:
+                self._page_cache[url] = truncated_text
             return truncated_text
 
         except httpx.TimeoutException:
             logger.warning("Page fetch timed out after %.1fs | URL: %s", self.fetch_timeout, url)
+            with self._page_cache_lock:
+                self._page_cache[url] = None
             return None
         except httpx.RequestError as exc:
             logger.warning("Page fetch network error: %s | URL: %s", exc, url)
+            with self._page_cache_lock:
+                self._page_cache[url] = None
             return None
         except Exception as exc:
             logger.warning("Unexpected error fetching page: %s | URL: %s", exc, url)
+            with self._page_cache_lock:
+                self._page_cache[url] = None
             return None
 
     @staticmethod
@@ -432,9 +459,18 @@ class CompanyResearchService:
 
         logger.info("Beginning batch research on %d search results", len(search_results))
 
-        for idx, item in enumerate(search_results, 1):
+        def research_one(item: SearchResult) -> Optional[CompanyProfile]:
+            try:
+                return self.research_search_result(item)
+            except Exception as exc:
+                logger.warning("Candidate research failed | URL: %s | Error: %s", item.url, exc)
+                return None
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            profiles = list(executor.map(research_one, search_results))
+
+        for idx, profile in enumerate(profiles, 1):
             logger.info("--- Processing Candidate [%d/%d] ---", idx, len(search_results))
-            profile = self.research_search_result(item)
 
             if not profile:
                 continue

@@ -7,6 +7,7 @@ without relying on static company lists.
 import logging
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import List, Optional
 from urllib.parse import urlparse
@@ -61,6 +62,10 @@ class TavilySearchService:
         """
         self.api_key = api_key or os.getenv("TAVILY_API_KEY")
         self.timeout = timeout
+        self._client: Optional[httpx.Client] = None
+        self._client_lock = threading.Lock()
+        self._cache: dict[tuple[str, int, str, tuple[str, ...], tuple[str, ...]], List[SearchResult]] = {}
+        self._cache_lock = threading.Lock()
 
         if not self.api_key or self.api_key.strip() in ("", "your_tavily_api_key_here"):
             logger.warning(
@@ -105,6 +110,15 @@ class TavilySearchService:
             logger.warning("Empty search query provided to SearchService. Returning empty list.")
             return []
 
+        cache_key = (
+            query.strip().lower(), max_results, search_depth,
+            tuple(include_domains or ()), tuple(exclude_domains or ()),
+        )
+        with self._cache_lock:
+            cached = self._cache.get(cache_key)
+        if cached is not None:
+            return list(cached)
+
         payload = {
             "api_key": self.api_key,
             "query": query.strip(),
@@ -125,8 +139,11 @@ class TavilySearchService:
         )
 
         try:
-            with httpx.Client(timeout=self.timeout) as client:
-                response = client.post(self.TAVILY_API_URL, json=payload)
+            with self._client_lock:
+                if self._client is None:
+                    self._client = httpx.Client(timeout=self.timeout)
+                client = self._client
+            response = client.post(self.TAVILY_API_URL, json=payload)
 
             if response.status_code == 401:
                 err_msg = "Tavily API Authentication Failed (401 Unauthorized). Check your TAVILY_API_KEY."
@@ -179,6 +196,8 @@ class TavilySearchService:
                     len(structured_results),
                 )
 
+            with self._cache_lock:
+                self._cache[cache_key] = list(structured_results)
             return structured_results
 
         except httpx.TimeoutException as exc:

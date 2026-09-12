@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 from urllib.parse import urlparse
@@ -38,11 +39,14 @@ class EmailDiscoveryService:
 
     def __init__(self, groq_api_key: Optional[str] = None, model: Optional[str] = None,
                  search_service: Optional[TavilySearchService] = None,
-                 page_fetcher: Optional[Callable[[str], Optional[str]]] = None) -> None:
+                 page_fetcher: Optional[Callable[[str], Optional[str]]] = None,
+                 max_workers: int = 3) -> None:
         self.groq_api_key = groq_api_key or os.getenv("GROQ_API_KEY")
         self.model = model or os.getenv("GROQ_MODEL", self.DEFAULT_MODEL)
         self.search_service = search_service or TavilySearchService()
         self.page_fetcher = page_fetcher or CompanyResearchService().fetch_webpage_text
+        self.max_workers = max(1, min(max_workers, 4))
+        self.max_extraction_workers = min(self.max_workers, 3)
         self.client: Optional[Groq] = None
         if self.groq_api_key and self.groq_api_key.strip() not in ("", "your_groq_api_key_here"):
             self.client = Groq(api_key=self.groq_api_key, timeout=25.0)
@@ -135,28 +139,67 @@ class EmailDiscoveryService:
             0 if item.source_type == "official_company_website" else 1, item.email or "",
         ))[0]
 
+    def _search_queries(self, queries: List[str]) -> List[SearchResult]:
+        pending = []
+        seen_queries = set()
+        for query in queries:
+            normalized = query.strip().lower()
+            if normalized and normalized not in seen_queries:
+                seen_queries.add(normalized)
+                pending.append(query)
+
+        def search(query: str) -> List[SearchResult]:
+            return self.search_service.search(query, max_results=2)
+
+        results: List[SearchResult] = []
+        seen_urls = set()
+        with ThreadPoolExecutor(max_workers=min(self.max_workers, max(1, len(pending)))) as executor:
+            futures = [executor.submit(search, query) for query in pending]
+            for query, future in zip(pending, futures):
+                try:
+                    for result in future.result():
+                        if result.url in seen_urls:
+                            continue
+                        seen_urls.add(result.url)
+                        results.append(result)
+                except Exception as exc:
+                    logger.warning("Email search failed | Query: %s | Error: %s", query, exc)
+            return results
+
+    def _fetch_sources(self, results: List[SearchResult]) -> List[tuple[SearchResult, str]]:
+        def fetch(result: SearchResult) -> tuple[SearchResult, str]:
+            return result, self.page_fetcher(result.url) or result.content
+
+        with ThreadPoolExecutor(max_workers=min(self.max_workers, max(1, len(results)))) as executor:
+            fetched = list(executor.map(fetch, results))
+        return [(result, source) for result, source in fetched if source]
+
+    def _extract_sources(
+        self, sources: List[tuple[SearchResult, str]], company: CompanyProfile, founder: FounderProfile
+    ) -> tuple[List[EmailCandidate], int]:
+        def extract(item: tuple[SearchResult, str]) -> List[EmailCandidate]:
+            result, source = item
+            return self._extract_candidates(source, result.url, company, founder)
+
+        candidates: List[EmailCandidate] = []
+        errors = 0
+        with ThreadPoolExecutor(max_workers=min(self.max_extraction_workers, max(1, len(sources)))) as executor:
+            futures = [executor.submit(extract, item) for item in sources]
+            for (result, _), future in zip(sources, futures):
+                try:
+                    candidates.extend(future.result())
+                except Exception as exc:
+                    errors += 1
+                    logger.warning("Email extraction failed | Source: %s | Error: %s", result.url, exc)
+        return candidates, errors
+
     def discover_email(self, company: CompanyProfile, founder: FounderProfile) -> EmailCandidate:
         if not QualificationService().qualify_profile(company).is_qualified or founder.discovery_status != FounderDiscoveryStatus.FOUND or not founder.founder_name:
             return EmailCandidate(company_name=company.company_name, founder_name=founder.founder_name or "", founder_role=founder.role or "", discovery_status=EmailDiscoveryStatus.NOT_FOUND)
-        results: List[SearchResult] = []
-        seen = set()
-        for query in self.build_queries(company, founder):
-            try:
-                for result in self.search_service.search(query, max_results=2):
-                    if result.url not in seen:
-                        seen.add(result.url); results.append(result)
-            except Exception as exc:
-                logger.warning("Email search failed | Company: %s | Error: %s", company.company_name, exc)
-        candidates: List[EmailCandidate] = []
-        errors = 0
-        for result in results:
-            source = self.page_fetcher(result.url) or result.content
-            if not source:
-                continue
-            try:
-                candidates.extend(self._extract_candidates(source, result.url, company, founder))
-            except Exception as exc:
-                errors += 1; logger.warning("Email extraction failed | Source: %s | Error: %s", result.url, exc)
+        results = self._search_queries(self.build_queries(company, founder))
+        sources = self._fetch_sources(results)
+        candidates, extraction_errors = self._extract_sources(sources, company, founder)
+        errors = extraction_errors
         selected = self._select(candidates, company)
         if selected:
             logger.info("Email discovered | Company: %s | Founder: %s", company.company_name, founder.founder_name)

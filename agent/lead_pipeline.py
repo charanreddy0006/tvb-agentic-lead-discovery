@@ -4,6 +4,7 @@ import argparse
 import csv
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -36,13 +37,15 @@ class LeadPipeline:
                  qualification_service: Optional[QualificationService] = None,
                  founder_service: Optional[FounderDiscoveryService] = None,
                  email_service: Optional[EmailDiscoveryService] = None,
-                 verification_service: Optional[EmailVerificationService] = None) -> None:
+                 verification_service: Optional[EmailVerificationService] = None,
+                 max_workers: int = 4) -> None:
         self.target_leads = target_leads
         self.max_iterations = max_iterations
         self.max_candidates = max_candidates
+        self.max_workers = max(1, min(max_workers, 5))
         self.planner = planner or QueryPlanner()
         self.search_service = search_service or TavilySearchService()
-        self.research_service = research_service or CompanyResearchService()
+        self.research_service = research_service or CompanyResearchService(max_workers=self.max_workers)
         self.qualification_service = qualification_service or QualificationService()
         self.founder_service = founder_service or FounderDiscoveryService(search_service=self.search_service)
         self.email_service = email_service or EmailDiscoveryService(search_service=self.search_service)
@@ -75,6 +78,33 @@ class LeadPipeline:
             }.items() if value}, qualification_reasons=qualification.rejection_reasons,
         )
 
+    def _search_queries(self, queries: List[str], seen_queries: set[str], seen_search_urls: set[str]):
+        pending = []
+        for query in queries:
+            normalized_query = query.strip().lower()
+            if normalized_query and normalized_query not in seen_queries:
+                seen_queries.add(normalized_query)
+                pending.append(query)
+
+        def search(query: str):
+            return self.search_service.search(query, max_results=5)
+
+        search_results = []
+        with ThreadPoolExecutor(max_workers=min(self.max_workers, max(1, len(pending)))) as executor:
+            futures = [executor.submit(search, query) for query in pending]
+            for query, future in zip(pending, futures):
+                try:
+                    for result in future.result():
+                        if result.url and result.url in seen_search_urls:
+                            continue
+                        if result.url:
+                            seen_search_urls.add(result.url)
+                        search_results.append(result)
+                except Exception as exc:
+                    logger.warning("Search failed for query '%s': %s", query, exc)
+                    self.stats["failures"] += 1
+        return search_results
+
     def run(self) -> List[QualifiedLead]:
         """Discover/process until target or configured safety limits are reached."""
         leads: List[QualifiedLead] = []
@@ -87,21 +117,7 @@ class LeadPipeline:
                 queries = self.planner.generate_queries(count=2)
             except Exception as exc:
                 self.stats["failures"] += 1; logger.warning("Iteration %d planner failed: %s", iteration, exc); continue
-            search_results = []
-            for query in queries:
-                normalized_query = query.strip().lower()
-                if not normalized_query or normalized_query in seen_queries:
-                    continue
-                seen_queries.add(normalized_query)
-                try:
-                    for result in self.search_service.search(query, max_results=5):
-                        if result.url and result.url in seen_search_urls:
-                            continue
-                        if result.url:
-                            seen_search_urls.add(result.url)
-                        search_results.append(result)
-                except Exception as exc:
-                    self.stats["failures"] += 1; logger.warning("Iteration %d search failed: %s", iteration, exc)
+            search_results = self._search_queries(queries, seen_queries, seen_search_urls)
             self.stats["discovered"] += len(search_results)
             remaining_capacity = self.max_candidates - self.stats["researched"]
             try:

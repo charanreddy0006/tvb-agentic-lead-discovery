@@ -101,6 +101,19 @@ class LeadPipelineTests(unittest.TestCase):
         self.assertEqual(search.calls, 1)
         self.assertEqual(research.items_seen, 1)
 
+    def test_search_fanout_preserves_order_and_isolates_failures(self):
+        class FanoutSearch:
+            def search(self, query, max_results=5):
+                if query == "bad":
+                    raise RuntimeError("search failed")
+                return [SearchResult(title=query, url=f"https://{query}.example", content="x")]
+
+        pipeline = self.pipeline([])
+        pipeline.search_service = FanoutSearch()
+        results = pipeline._search_queries(["first", "bad", "FIRST", "second"], set(), set())
+        self.assertEqual([result.title for result in results], ["first", "second"])
+        self.assertEqual(pipeline.stats["failures"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
