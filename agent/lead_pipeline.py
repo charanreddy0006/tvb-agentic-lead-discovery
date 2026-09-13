@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from agent.planner import QueryPlanner
+from agent.planner import QueryPlanner, _is_company_search_result
 from core.email_models import EmailDiscoveryStatus, EmailVerificationStatus
 from core.founder_models import FounderDiscoveryStatus
 from core.lead_models import QualifiedLead
@@ -43,9 +43,11 @@ class LeadPipeline:
         self.max_iterations = max_iterations
         self.max_candidates = max_candidates
         self.max_workers = max(1, min(max_workers, 5))
+        # Search may remain concurrent, but Groq-backed research is strictly sequential.
+        self.research_workers = 1
         self.planner = planner or QueryPlanner()
         self.search_service = search_service or TavilySearchService()
-        self.research_service = research_service or CompanyResearchService(max_workers=self.max_workers)
+        self.research_service = research_service or CompanyResearchService(max_workers=self.research_workers)
         self.qualification_service = qualification_service or QualificationService()
         self.founder_service = founder_service or FounderDiscoveryService(search_service=self.search_service)
         self.email_service = email_service or EmailDiscoveryService(search_service=self.search_service)
@@ -95,7 +97,7 @@ class LeadPipeline:
                 pending.append(query)
 
         def search(query: str):
-            return self.search_service.search(query, max_results=5)
+            return self.search_service.search(query, max_results=6)
 
         search_results = []
         with ThreadPoolExecutor(max_workers=min(self.max_workers, max(1, len(pending)))) as executor:
@@ -103,6 +105,13 @@ class LeadPipeline:
             for query, future in zip(pending, futures):
                 try:
                     for result in future.result():
+                        if not _is_company_search_result(result):
+                            logger.info(
+                                "Skipping non-company discovery result | URL: %s | Title: %s",
+                                result.url,
+                                result.title,
+                            )
+                            continue
                         if result.url and result.url in seen_search_urls:
                             continue
                         if result.url:
@@ -132,7 +141,7 @@ class LeadPipeline:
             if len(leads) >= self.target_leads or self.stats["researched"] >= self.max_candidates:
                 break
             try:
-                queries = self.planner.generate_queries(count=2)
+                queries = self.planner.generate_queries(count=4)
             except Exception as exc:
                 self.stats["failures"] += 1; logger.warning("Iteration %d planner failed: %s", iteration, exc); continue
             search_results = self._search_queries(queries, seen_queries, seen_search_urls)

@@ -1,217 +1,1141 @@
-# TVB Agentic Company Lead Discovery
+# TVB Agentic Lead Discovery
 
-An autonomous agent designed to discover, evaluate, and verify high-potential technology platform companies matching **The Venture Build (TVB)** target investment and venture acceleration profile.
+An evidence-first, agentic lead discovery platform built for the **The Venture Build (TVB)** use case.
 
-> **Project Status**: Steps 1-9 are implemented. Step 10 final QA hardens final-lead gating, deduplication, bounded discovery, and local Demo Mode validation. No live 15-lead run has been performed.
+The system dynamically discovers technology companies, researches them, validates qualification criteria, identifies a CEO/founder, discovers an explicitly supported professional email, verifies the email, and returns only leads that pass all required gates.
 
-## Overview
+---
 
-TVB Agentic Lead Discovery is an evidence-first research application for finding technology companies that fit TVB's target profile, validating their business, identifying a CEO or founder, and returning only leads with an explicitly sourced and verified professional email.
+## Features
 
-### Problem
+- Dynamic company discovery using live web search
+- Agentic search-query planning
+- Company research and structured extraction
+- Financial qualification
+- Technology/platform qualification
+- Geographic qualification
+- Founder / CEO discovery
+- Public professional email discovery
+- Email syntax and DNS/MX verification
+- Evidence-first validation
+- Groq rate-limit fallback
+- Duplicate filtering
+- Demo / Mock Mode
+- Live Agent Mode
+- CSV export
+- Streamlit web interface
+- Automated test suite
 
-Finding suitable companies and trustworthy founder contact information requires several research steps. Unverified financial claims, guessed identities, generic inboxes, and incomplete email checks can create unusable or misleading lead lists.
+---
 
-### Solution
+## Pipeline
 
-The application combines dynamic web discovery, structured company research, deterministic qualification, evidence-backed founder discovery, source-backed email discovery, and non-invasive email verification. Every final lead retains source URLs and supporting evidence for inspection.
+```text
+User
+  |
+  v
+Streamlit UI
+  |
+  v
+Lead Pipeline
+  |
+  +--> Query Planner
+  |
+  +--> Tavily Web Discovery
+  |
+  +--> Company Research
+  |
+  +--> Qualification
+  |       |
+  |       +--> Financial
+  |       +--> Technology
+  |       +--> Geography
+  |
+  +--> Founder / CEO Discovery
+  |
+  +--> Email Discovery
+  |
+  +--> Email Verification
+  |
+  v
+Final Verified Leads
+```
 
-## Architecture
+The pipeline follows:
+
+```text
+DISCOVER
+   ->
+RESEARCH
+   ->
+QUALIFY
+   ->
+FIND FOUNDER
+   ->
+FIND EXPLICIT EMAIL
+   ->
+VERIFY
+   ->
+FINAL LEAD
+```
+
+---
+
+## Target Lead Criteria
+
+A company should satisfy all of the following requirements.
+
+### 1. Financial
+
+The company must have either:
+
+- Funding between **$1M and $5M USD**, inclusive
+- OR annual revenue / ARR between **$1M and $5M USD**, inclusive
+
+```text
+$1M <= Funding/Revenue <= $5M USD
+```
+
+Examples:
+
+```text
+$2M USD  -> PASS
+$5M USD  -> PASS
+$1M USD  -> PASS
+$800K    -> FAIL
+$7M      -> FAIL
+```
+
+Currencies such as EUR or GBP are not silently converted.
+
+```text
+EUR/GBP amount without supported USD conversion -> UNKNOWN
+```
+
+---
+
+### 2. Technology
+
+The company must operate a genuine technology product or platform.
+
+Examples:
+
+- SaaS
+- B2B software
+- AI/ML platform
+- Data platform
+- Cloud infrastructure
+- Developer tools
+- API platform
+- Automation platform
+- Fintech infrastructure
+- Cybersecurity platform
+- Digital platform
+
+Consulting-only or service-only companies should not qualify.
+
+---
+
+### 3. Geography
+
+The company should be primarily based outside the United States.
+
+The system looks for evidence such as:
+
+```text
+Headquartered in ...
+Based in ...
+HQ in ...
+Operations in ...
+Office in ...
+```
+
+A US investor, US customer, or US media article does not automatically mean that the company is US-based.
+
+---
+
+### 4. Founder / CEO
+
+The final lead must have an identified:
+
+- CEO
+- Founder
+- Co-founder
+
+The person's identity and role must be supported by public evidence.
+
+---
+
+### 5. Professional Email
+
+The final lead must have an explicitly published professional email.
+
+The system does NOT guess emails.
+
+It will not automatically create:
+
+```text
+firstname@company.com
+first.last@company.com
+```
+
+Generic addresses such as:
+
+```text
+info@
+support@
+hello@
+contact@
+```
+
+are not treated as founder contact information.
+
+Third-party fundraising or contact-service emails are rejected when they do not belong to the company.
+
+---
+
+### 6. Verification
+
+The email must pass:
+
+- Syntax validation
+- Domain validation
+- DNS/MX validation
+- Founder/email association validation
+
+The system does not perform invasive SMTP mailbox probing.
+
+---
+
+# Architecture
 
 ```mermaid
 flowchart TD
-    User --> Streamlit
-    Streamlit --> LeadPipeline
-    LeadPipeline --> QueryPlanner
-    QueryPlanner --> Tavily[Tavily discovery]
-    Tavily --> CompanyResearch[Company research]
-    CompanyResearch --> Qualification
-    Qualification --> Founder[Founder discovery]
-    Founder --> Email[Email discovery]
-    Email --> Verification[Email verification]
-    Verification --> Leads[Qualified leads]
+    A[User] --> B[Streamlit UI]
+    B --> C[Lead Pipeline]
+    C --> D[Query Planner]
+    D --> E[Tavily Search]
+    E --> F[Company Research]
+    F --> G[Qualification]
+    G -->|PASS| H[Founder Discovery]
+    G -->|FAIL / UNKNOWN| X[Reject]
+    H -->|Founder Found| I[Email Discovery]
+    H -->|Not Found| X
+    I -->|Email Found| J[Email Verification]
+    I -->|No Supported Email| X
+    J -->|VERIFIED| K[Final Leads]
+    J -->|FAILED| X
+    K --> L[CSV / Streamlit Output]
 ```
 
-### Technology Stack
+---
+
+# Pipeline Stages
+
+## 1. Discovery
+
+The planner dynamically creates company-search queries based on:
+
+- Sector
+- Geography
+- Funding/revenue signals
+- Technology keywords
+- Startup/company terminology
+
+Tavily executes the queries against the live web.
+
+The system filters obvious non-company results such as:
+
+- Funding lists
+- Industry reports
+- General articles
+- VC pages
+- Irrelevant social-media posts
+- Other non-company pages
+
+No fixed company list is used.
+
+---
+
+## 2. Research
+
+The research service converts search results into structured company profiles.
+
+It attempts to extract:
+
+```text
+Company Name
+Website
+Industry
+Description
+Location
+Funding
+Funding Currency
+Revenue / ARR
+Evidence
+Source URLs
+```
+
+### Hybrid Research
+
+Groq is used when available, but deterministic extraction is also available.
+
+```text
+Tavily Evidence
+      |
+      +--> Webpage Content
+      |
+      v
+Evidence Extraction
+      |
+      +--> Deterministic Recovery
+      |
+      +--> Groq Enhancement
+      |
+      v
+Company Profile
+```
+
+This prevents the entire research stage from stopping when Groq is temporarily unavailable or rate-limited.
+
+---
+
+## 3. Qualification
+
+Three major gates are evaluated:
+
+```text
+Financial
+Technology
+Geography
+```
+
+Each gate returns:
+
+```text
+PASS
+FAIL
+UNKNOWN
+```
+
+A company is qualified only when:
+
+```text
+Financial  = PASS
+Technology = PASS
+Geography  = PASS
+```
+
+Missing evidence is not treated as a pass.
+
+---
+
+## 4. Founder Discovery
+
+Founder discovery runs only for qualified companies.
+
+The service searches for:
+
+- CEO
+- Founder
+- Co-founder
+- Leadership information
+
+The person's name and role are validated before the result is passed to the email stage.
+
+Malformed results such as:
+
+```text
+CTO of CompanyJohn Doe
+```
+
+are rejected.
+
+---
+
+## 5. Email Discovery
+
+The service searches specifically for the identified founder.
+
+Example search patterns:
+
+```text
+"Jane Doe" "Example Technologies" email
+"Jane Doe" "@example.com"
+"Jane Doe" CEO email
+site:example.com "Jane Doe" email
+```
+
+Potential sources include:
+
+- Company websites
+- Press releases
+- Interviews
+- Conference profiles
+- Public professional profiles
+- Public articles
+
+The system does not generate an email address from a naming pattern.
+
+---
+
+## 6. Email Verification
+
+The verification flow is:
+
+```text
+Email
+  |
+  +--> Syntax
+  |
+  +--> Domain
+  |
+  +--> DNS / MX
+  |
+  +--> Founder Association
+  |
+  v
+VERIFIED
+```
+
+`VERIFIED` means that the email has valid syntax, uses a valid domain, has mail infrastructure, and is supported by evidence as associated with the founder/CEO.
+
+It does not guarantee that a specific mailbox is active.
+
+---
+
+# Agentic Behavior
+
+The system behaves as a bounded agentic pipeline.
+
+It can:
+
+1. Plan search queries
+2. Rotate sectors and geographic targets
+3. Search the live web
+4. Filter irrelevant results
+5. Research companies
+6. Evaluate qualification gates
+7. Discover founders
+8. Discover public emails
+9. Verify emails
+10. Continue searching until the target or configured limits are reached
+
+Execution is bounded by:
+
+```text
+Target Leads
+Max Iterations
+Max Candidates
+```
+
+---
+
+# Rate-Limit Resilience
+
+API usage is controlled through bounded execution.
+
+The research service uses a hybrid strategy:
+
+### Groq Available
+
+```text
+Tavily
+  ->
+Evidence
+  ->
+Groq
+  ->
+Structured Profile
+```
+
+### Groq Unavailable / Rate Limited
+
+```text
+Tavily
+  ->
+Evidence
+  ->
+Deterministic Extraction
+  ->
+Structured Profile
+```
+
+The system therefore does not depend completely on the LLM for basic evidence extraction.
+
+However, it still refuses to guess information that cannot be supported.
+
+---
+
+# Evidence-First Design
+
+The project is designed to minimize hallucinations and false leads.
+
+## No Unsupported Financial Data
+
+If a source says:
+
+```text
+€3M funding
+```
+
+the system does not automatically change it to:
+
+```text
+$3M funding
+```
+
+---
+
+## No Guessed Emails
+
+The system does not infer:
+
+```text
+john.smith@company.com
+```
+
+only because the founder's name is John Smith.
+
+---
+
+## No Malformed Founder Names
+
+The system validates extracted person names before accepting them.
+
+---
+
+## No Unrelated Third-Party Emails
+
+For example:
+
+```text
+Company: Example.ai
+Founder: John Smith
+Email: support@fundraising-service.com
+```
+
+is not treated as a valid founder email.
+
+When the company domain is known, the email domain is checked for compatibility.
+
+---
+
+## UNKNOWN Is Safer Than Guessing
+
+When evidence is insufficient:
+
+```text
+UNKNOWN
+```
+
+is returned.
+
+This improves lead precision.
+
+---
+
+# Technology Stack
+
+| Technology | Purpose |
+|---|---|
+| Python | Application development |
+| Streamlit | Web interface |
+| Groq | Agentic planning and optional extraction |
+| Tavily | Dynamic web search |
+| Pydantic | Data validation |
+| HTTPX | Web requests |
+| BeautifulSoup | HTML parsing |
+| dnspython | DNS/MX verification |
+| Pandas | Data processing and CSV output |
+| Pytest | Automated testing |
+
+---
+
+# Project Structure
+
+```text
+TVB-Agentic-Lead-Discovery/
+|
++-- app.py
++-- README.md
++-- requirements.txt
++-- .env.example
++-- .gitignore
+|
++-- agent/
+|   +-- __init__.py
+|   +-- planner.py
+|   +-- lead_pipeline.py
+|
++-- core/
+|   +-- __init__.py
+|   +-- models.py
+|   +-- validation_models.py
+|   +-- founder_models.py
+|   +-- email_models.py
+|   +-- lead_models.py
+|
++-- services/
+|   +-- __init__.py
+|   +-- search_service.py
+|   +-- company_research_service.py
+|   +-- qualification_service.py
+|   +-- founder_discovery_service.py
+|   +-- email_discovery_service.py
+|   +-- email_verification_service.py
+|   +-- mock_pipeline.py
+|
++-- tests/
+|   +-- test_company_research_service.py
+|   +-- test_qualification_service.py
+|   +-- test_founder_discovery_service.py
+|   +-- test_email_services.py
+|   +-- test_mock_pipeline.py
+|   +-- test_lead_pipeline.py
+|   +-- test_performance.py
+|
++-- data/
+    +-- .gitkeep
+```
+
+---
+
+# Setup
+
+## Prerequisites
+
+Install:
 
 - Python 3.10+
-- Streamlit for the local dashboard
-- Groq for dynamic query generation and structured extraction
-- Tavily for web search
-- Pydantic for validated data models
-- HTTPX and BeautifulSoup for source retrieval and parsing
-- dnspython for non-invasive MX checks
-
-## Pipeline Flow
-
-`QueryPlanner -> TavilySearchService -> CompanyResearchService -> QualificationService -> FounderDiscoveryService -> EmailDiscoveryService -> EmailVerificationService -> QualifiedLead`
-
-The autonomous loop is bounded by `target_leads`, `max_iterations`, and `max_candidates`. It continues searching until the requested number of final verified leads is reached or a configured limit is exhausted. Real-world yield depends on available search results and source evidence; the project has not demonstrated 15 real verified leads yet.
-
-### Email Discovery and Email Verification
-
-Email Discovery accepts only an address explicitly associated with the evidenced founder or CEO in a public source. It does not construct or guess addresses and rejects generic inboxes. Email Verification checks syntax, DNS/MX infrastructure, and explicit founder association without SMTP mailbox probing.
-
-## Step 4: Company Qualification & Validation
-
-Step 4 evaluates each Step 3 `CompanyProfile` with deterministic, evidence-first rules. A company is qualified only when all criteria are `PASS`; a `FAIL` or `UNKNOWN` on any criterion means it is not qualified yet.
-
-- **Financial:** Explicit funding or explicitly annual revenue/ARR must be between $1M and $5M USD, inclusive. Non-USD amounts remain in their original currency and are `UNKNOWN` until a verified conversion exists; no exchange rates are inferred.
-- **Technology:** The description, industry, or preserved evidence must show that the company sells a genuine software, SaaS, API, or platform product. Consulting/services wording alone does not pass.
-- **Geographic:** A known non-US headquarters can pass when no significant US operations are evidenced. US investors, customers, or press coverage do not themselves fail the check.
-- **Evidence:** Every pass retains supporting profile evidence and source URLs. Missing or ambiguous evidence results in `UNKNOWN`, never a fabricated pass.
-
-Run the live Step 4 demo with:
-
-```bash
-python -m services.qualification_service
-```
-
-## Step 5: Founder Discovery
-
-Only companies that still pass all Step 4 checks proceed to founder research. Step 5 uses dynamic Tavily searches and Groq extraction to find one explicitly evidenced CEO or founder/co-founder. It preserves the supporting source URL and verbatim evidence, validates the role, and never guesses identity details. Results are `FOUND`, `NOT_FOUND`, or `UNCERTAIN` when evidence is insufficient or conflicting.
-
-Run the live Step 5 demo with:
-
-```bash
-python -m services.founder_discovery_service
-```
-
-## Steps 6-8: Email and Autonomous Lead Pipeline
-
-The bounded pipeline is: **Company -> Qualification -> Founder -> Email -> Verification -> Final Lead**. Emails are never generated or guessed. A final lead requires a Step 4-qualified company, an evidence-backed CEO/founder, an explicitly sourced professional email, and safe verification by syntax, DNS/MX, and explicit founder association.
-
-Run a credit-safe development pass:
-
-```bash
-python -m agent.lead_pipeline --target-leads 1 --max-iterations 3 --max-candidates 30
-```
-
-For the assignment target, set `--target-leads 15`. `max_iterations` and `max_candidates` bound API use and prevent uncontrolled searching. Only final verified leads are exported locally to `data/final_leads.csv`, which is ignored by Git.
-
-## Step 9: Streamlit Interface
-
-Run the local product interface with:
-
-```bash
-streamlit run app.py
-```
-
-### 6. Run Tests
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-### 7. Configure a Run
-
-The Streamlit sidebar controls `Target Leads`, `Max Iterations`, `Max Candidates`, and `Execution Mode`. Demo Mode is intended for UI development and evaluation without external calls. Live Agent Mode requires configured Groq and Tavily credentials and runs only after the user clicks the discovery button.
-
-## Security and Data Handling
-
-- Copy `.env.example` to `.env`; never commit `.env` or API keys.
-- `.env.*` is ignored except for the placeholder `.env.example`.
-- Generated CSV and JSON files under `data/` are ignored.
-- Demo companies exist only in `services/mock_pipeline.py` and are clearly labelled.
-- Real lead output is written locally only when explicitly exported.
-- Email verification uses syntax, MX infrastructure, and explicit founder association; it does not use SMTP mailbox probing.
-
-## Limitations
-
-- A live 15-lead run has not been performed because API credits are limited.
-- Search and source quality determine how many companies pass all gates.
-- MX validation confirms mail infrastructure, not mailbox deliverability.
-- The application is locally runnable; public hosting and production credential management are not included.
-
-The default **Demo / Mock Mode** uses clearly labelled fictional data and makes no Groq, Tavily, DNS, or other external calls. It demonstrates final-lead metrics, rejection analytics, evidence inspection, and in-memory CSV download.
-
-**Live Agent Mode** is manually triggered only after configuration. It uses the existing bounded `LeadPipeline` with configurable target leads, maximum iterations, and maximum candidates. Emails are never generated or guessed; the final table and CSV contain only leads with a verified, evidence-backed founder/CEO email.
-
-The default Demo Mode is fictional, deterministic, and local-only. Live Mode uses the real pipeline only after the user explicitly clicks the discovery button and requires configured Groq and Tavily credentials. API keys are never displayed in the UI.
-
-## Step 10: Final QA and Production Hardening
-
-The final gate requires a qualified company, an evidence-backed CEO/founder/co-founder, a source-backed founder email, and `VERIFIED` email status. Contradictory founder evidence is marked uncertain; duplicate companies, queries, source URLs, and founder/email pairs are suppressed within a bounded run. No external API calls are made by Demo Mode, and no live discovery run is performed automatically.
-
----
-
-## 🎯 Target Company Parameters
-
-1. **Funding / Revenue**: Between **$1,000,000 and $5,000,000 USD** (Seed, Late Seed, or Pre-Series A).
-2. **Platform Nature**: Operates a **technology-related platform** (SaaS, Cloud Infrastructure, Developer Tools, B2B software, Data Orchestration, AI/ML).
-3. **Geographic Focus**: **Minimal to no presence in the US** (HQ and core operations outside the United States, e.g., Europe, UK, India, Southeast Asia, MENA, LATAM).
-4. **Verified Leadership**: Identifies **CEO or Co-founder** with a **verified professional email**.
-5. **Autonomy**: Discovers sources and leads dynamically without static or hardcoded company lists.
-6. **Zero Hallucination**: Unverified or unsupported fields are intentionally left blank rather than filled with fabricated data.
-7. **Target Output**: Targets a minimum of **15 leads** matching all criteria with evidence links; this target has not yet been proven in a live run.
-
----
-
-## 📁 Project Structure
-
-```
-TVB-Agentic-Lead-Discovery/
-│
-├── app.py                  # Streamlit dashboard and evaluator interface
-├── requirements.txt        # Pinned initial project dependencies
-├── .env.example            # Environment configuration template
-├── .gitignore              # Git ignore rules for secrets, cache, and venv
-├── README.md               # Project documentation
-│
-├── agent/                  # Orchestration, planning, and agent state
-│   └── __init__.py
-│
-├── services/               # Search, scraping, extraction, email verification
-│   └── __init__.py
-│
-├── core/                   # Shared configurations, Pydantic schemas, state
-│   └── __init__.py
-│
-└── data/                   # Output storage for verified lead datasets
-    └── .gitkeep
-```
-
----
-
-## 🚀 Quickstart & Setup
-
-### 1. Prerequisites
-
-- Python 3.10+ (Tested on Python 3.11)
 - Git
+- Internet connection for Live Agent Mode
 
-### 2. Create and Activate Virtual Environment
+Python 3.11+ is recommended.
 
-**Windows (PowerShell):**
+---
+
+## Clone
+
+```bash
+git clone https://github.com/charanreddy0006/tvb-agentic-lead-discovery.git
+cd tvb-agentic-lead-discovery
+```
+
+---
+
+## Create Virtual Environment
+
+### Windows PowerShell
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-**macOS / Linux:**
+### macOS / Linux
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-### 3. Install Dependencies
+---
+
+## Install Dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4. Configure Environment Variables
+---
 
-Copy `.env.example` to `.env` and fill in your API credentials:
+# Environment Variables
 
-```bash
-cp .env.example .env
+Create `.env` from `.env.example`.
+
+### Windows PowerShell
+
+```powershell
+Copy-Item .env.example .env
 ```
 
-### 5. Run the Streamlit Application
+Add:
+
+```env
+GROQ_API_KEY=your_groq_api_key
+TAVILY_API_KEY=your_tavily_api_key
+GROQ_MODEL=openai/gpt-oss-20b
+```
+
+Never commit the real `.env` file.
+
+---
+
+# Running the Application
+
+Start the application:
 
 ```bash
 streamlit run app.py
 ```
+
+The Streamlit dashboard will open in the browser.
+
+---
+
+# Demo / Mock Mode
+
+Demo / Mock Mode is useful for:
+
+- Testing
+- UI demonstrations
+- Evaluator walkthroughs
+- Development without API credits
+
+Flow:
+
+```text
+Mock Discovery
+     ->
+Mock Research
+     ->
+Mock Qualification
+     ->
+Mock Founder
+     ->
+Mock Email
+     ->
+Mock Verification
+     ->
+Final Lead
+```
+
+---
+
+# Live Agent Mode
+
+Live Agent Mode uses the actual Groq and Tavily services.
+
+Recommended assignment configuration:
+
+```text
+Target Leads   = 15
+Max Iterations = 5
+Max Candidates = 75
+Execution Mode = Live Agent
+```
+
+Click:
+
+```text
+Discover Qualified Leads
+```
+
+to start the run.
+
+---
+
+# Output
+
+The Streamlit dashboard displays:
+
+```text
+Companies Discovered
+Companies Researched
+Qualified Companies
+Founders Found
+Emails Discovered
+Verified Emails
+Final Leads
+```
+
+The final table contains information such as:
+
+| Field | Description |
+|---|---|
+| Company | Qualified company |
+| Industry | Technology/product category |
+| Location | Company location |
+| Founder / CEO | Identified founder or CEO |
+| Role | CEO / Founder / Co-founder |
+| Verified Email | Explicitly supported email |
+| Funding | Supported funding |
+| Revenue | Supported revenue / ARR |
+| Verification | Verification result |
+
+The application also provides CSV download.
+
+---
+
+# Testing
+
+Run:
+
+```bash
+python -m pytest -q
+```
+
+The tests cover:
+
+- Company research
+- Financial extraction
+- Geographic validation
+- Technology validation
+- Founder discovery
+- Email discovery
+- Email verification
+- Mock pipeline
+- Lead pipeline
+- Performance
+- Rate-limit fallback behavior
+
+The current project has been validated with the automated test suite.
+
+---
+
+# Security
+
+## API Keys
+
+Never commit:
+
+```text
+.env
+API keys
+Access tokens
+Credentials
+```
+
+Use:
+
+```text
+.env.example
+```
+
+as the safe template.
+
+---
+
+## Email Safety
+
+The application:
+
+- Does not guess founder emails
+- Does not send emails
+- Does not log into mailboxes
+- Does not perform invasive SMTP probing
+- Uses public evidence
+- Uses DNS/MX checks
+
+---
+
+# Limitations
+
+## Search Results
+
+Some websites may:
+
+- Block automated requests
+- Return HTTP 403
+- Require JavaScript
+- Provide incomplete content
+- Contain outdated information
+
+The system uses available snippets and fallback extraction where possible.
+
+---
+
+## API Limits
+
+Groq and Tavily are subject to account/provider limits.
+
+The application reduces usage through:
+
+- Bounded iterations
+- Candidate limits
+- Query limits
+- Deterministic extraction
+- Fallback logic
+
+---
+
+## Email Verification
+
+DNS/MX verification confirms mail infrastructure.
+
+It does not prove that:
+
+```text
+Mailbox exists
+Mailbox is active
+Person will read the email
+```
+
+---
+
+## Lead Yield
+
+The target is:
+
+```text
+15 verified leads
+```
+
+The system does not fabricate leads to reach the target.
+
+The final count can be lower if suitable companies or public evidence are unavailable.
+
+---
+
+# Deployment
+
+The application can be deployed using Streamlit Community Cloud or another Python-compatible hosting platform.
+
+## GitHub Repository
+
+```text
+https://github.com/charanreddy0006/tvb-agentic-lead-discovery
+```
+
+## Live Streamlit Application
+
+```text
+https://tvb-agentic-lead-discovery-buaxwhypwurteyqmrpr8vu.streamlit.app/
+```
+
+For deployment, configure secrets through the hosting platform.
+
+Example:
+
+```toml
+GROQ_API_KEY = "your_groq_api_key"
+TAVILY_API_KEY = "your_tavily_api_key"
+GROQ_MODEL = "openai/gpt-oss-20b"
+```
+
+Never commit real credentials.
+
+---
+
+# Example
+
+A hypothetical company:
+
+```text
+Company: Example AI
+Location: Singapore
+Funding: $3M USD
+Industry: AI / SaaS
+Founder: Jane Doe
+Role: Co-founder & CEO
+Email: jane@example.ai
+```
+
+### Discovery
+
+Tavily discovers the company through a public source.
+
+```text
+Company discovered
+```
+
+### Research
+
+```text
+Funding   = $3M USD
+Location  = Singapore
+Technology = AI / SaaS
+```
+
+### Qualification
+
+```text
+Financial   = PASS
+Technology  = PASS
+Geography   = PASS
+```
+
+Result:
+
+```text
+QUALIFIED
+```
+
+### Founder
+
+```text
+Jane Doe
+Co-founder & CEO
+```
+
+### Email
+
+```text
+jane@example.ai
+```
+
+### Verification
+
+```text
+Syntax      = PASS
+MX          = PASS
+Association = PASS
+```
+
+Result:
+
+```text
+VERIFIED
+```
+
+### Final Lead
+
+```text
+Example AI
+Singapore
+Jane Doe
+Co-founder & CEO
+jane@example.ai
+$3M USD
+VERIFIED
+```
+
+---
+
+# Evaluation Checklist
+
+The project includes:
+
+- [x] Dynamic company discovery
+- [x] Web-based research
+- [x] Financial qualification
+- [x] Technology qualification
+- [x] Geographic qualification
+- [x] Founder / CEO discovery
+- [x] Public professional email discovery
+- [x] Email verification
+- [x] Evidence-backed validation
+- [x] No guessed founder emails
+- [x] No static company list
+- [x] Bounded agentic execution
+- [x] Demo / Mock Mode
+- [x] Live Agent Mode
+- [x] Streamlit interface
+- [x] CSV output
+- [x] Automated tests
+- [x] GitHub repository
+- [x] Public Streamlit deployment
+
+### Target
+
+```text
+15 verified leads
+```
+
+The system attempts to reach this target without compromising validation quality.
+
+---
+
+# Design Principles
+
+## Evidence First
+
+Important decisions should be supported by public evidence.
+
+## Precision Over Volume
+
+A smaller number of accurate leads is better than a larger list containing false information.
+
+## No Hallucinated Contacts
+
+Founder names and emails are not invented.
+
+## Dynamic Discovery
+
+Companies are discovered through live search rather than a hardcoded list.
+
+## Bounded Autonomy
+
+The agent can search and continue iterating, but execution is controlled by explicit limits.
+
+---
+
+# Future Improvements
+
+Potential improvements include:
+
+- Multiple LLM providers
+- Multiple search providers
+- Better source ranking
+- Improved company-domain discovery
+- Trusted currency conversion
+- Stronger deduplication
+- Persistent lead database
+- Scheduled discovery
+- Lead scoring
+- Better source citation UI
+- Production monitoring
+- Advanced analytics
+
+---
+
+# Conclusion
+
+**TVB Agentic Lead Discovery** combines dynamic web search, agentic planning, structured research, qualification, founder discovery, email discovery, and verification into one bounded workflow.
+
+The system is designed to avoid:
+
+```text
+Static Lists
+False Company Matches
+Unsupported Funding Claims
+Wrong Geography
+Incorrect Founder Identity
+Guessed Emails
+Generic Inboxes
+Third-Party Contact Emails
+Unverified Leads
+```
+
+Instead, it follows:
+
+```text
+DISCOVER
+   ->
+RESEARCH
+   ->
+QUALIFY
+   ->
+FIND FOUNDER
+   ->
+FIND EXPLICIT EMAIL
+   ->
+VERIFY
+   ->
+FINAL LEAD
+```
+
+The result is an evidence-backed lead rather than simply a company found through a web search.
+
+---
+
+# Project Links
+
+## GitHub
+
+```text
+https://github.com/charanreddy0006/tvb-agentic-lead-discovery
+```
+
+## Live Application
+
+```text
+https://tvb-agentic-lead-discovery-buaxwhypwurteyqmrpr8vu.streamlit.app/
+```
+
+---
+
+**TVB Agentic Lead Discovery**
+
+**Discover • Qualify • Verify**

@@ -35,6 +35,35 @@ class FounderDiscoveryServiceTests(unittest.TestCase):
             {"founder_name": name, "role": role, "evidence": evidence}, evidence, self.source_url, self.profile
         )
 
+
+    def test_founder_extraction_uses_low_reasoning_and_larger_output_budget(self) -> None:
+        class Message:
+            content = '{"company_match": true, "candidates": [{"founder_name": "Jane Doe", "role": "CEO", "linkedin_url": null, "evidence": "Fixture Platform CEO Jane Doe leads the company."}]}'
+
+        class Response:
+            choices = [type("Choice", (), {"message": Message()})()]
+
+        class Client:
+            def __init__(self):
+                self.kwargs = None
+            class Chat:
+                pass
+
+        class Completions:
+            def __init__(self):
+                self.kwargs = None
+            def create(self, **kwargs):
+                self.kwargs = kwargs
+                return Response()
+
+        service = FounderDiscoveryService(groq_api_key="test-key", page_fetcher=lambda _: None)
+        completions = Completions()
+        service.client = type("Client", (), {"chat": type("Chat", (), {"completions": completions})()})()
+        candidates = service._extract_candidates("Fixture Platform CEO Jane Doe leads the company.", self.source_url, self.profile)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(completions.kwargs["reasoning_effort"], "low")
+        self.assertEqual(completions.kwargs["max_completion_tokens"], 900)
+
     def test_valid_ceo_extraction(self) -> None:
         candidate = self.candidate("Jane Doe", "CEO", "Fixture Platform CEO Jane Doe leads the company.")
         self.assertIsNotNone(candidate)

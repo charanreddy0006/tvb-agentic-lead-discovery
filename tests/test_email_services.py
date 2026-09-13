@@ -43,6 +43,10 @@ class EmailServiceTests(unittest.TestCase):
         company_domain = self.candidate("jane@fixture.example", "Jane Doe, CEO of Fixture Platform: jane@fixture.example.")
         self.assertEqual(self.service._select([external, company_domain], self.company).email, "jane@fixture.example")
 
+    def test_external_only_email_is_rejected(self) -> None:
+        external = self.candidate("jane@professional.example", "Jane Doe, CEO of Fixture Platform: jane@professional.example.")
+        self.assertIsNone(self.service._select([external], self.company))
+
     def test_verification_outcomes(self) -> None:
         invalid = EmailVerificationService(lambda _: True).verify(EmailCandidate(company_name="x", founder_name="Jane Doe", founder_role="CEO", email="not-an-email"))
         self.assertEqual(invalid.status, EmailVerificationStatus.INVALID)

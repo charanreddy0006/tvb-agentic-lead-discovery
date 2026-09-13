@@ -39,17 +39,28 @@ class _Client:
         self.chat = type(
             "Chat",
             (),
-            {"completions": _Completions(content)},
+            {
+                "completions": _Completions(content),
+            },
         )()
 
 
 class CompanyResearchServiceTests(unittest.TestCase):
 
-    def _service_for_payload(self, payload: object) -> CompanyResearchService:
-        service = CompanyResearchService(groq_api_key="test-key")
-        service.client = _Client(
-            payload if isinstance(payload, str) else json.dumps(payload)
+    def _service_for_payload(
+        self,
+        payload: object,
+    ) -> CompanyResearchService:
+        service = CompanyResearchService(
+            groq_api_key="test-key"
         )
+
+        service.client = _Client(
+            payload
+            if isinstance(payload, str)
+            else json.dumps(payload)
+        )
+
         return service
 
     def test_preserves_source_backed_evidence_and_validates_revenue_currency(
@@ -75,20 +86,30 @@ class CompanyResearchServiceTests(unittest.TestCase):
             "revenue_amount": 2_000_000,
             "revenue_currency": "EUR",
             "evidence": {
-                "funding": "Acme Platform raised USD 2 million total.",
-                "revenue": "Annual revenue reached $2M.",
-                "technology": "It sells a cloud platform.",
+                "funding": (
+                    "Acme Platform raised USD 2 million total."
+                ),
+                "revenue": (
+                    "Annual revenue reached $2M."
+                ),
+                "technology": (
+                    "It sells a cloud platform."
+                ),
                 "headquarters": (
                     "Acme Platform is headquartered in Paris, France."
                 ),
                 "location": (
                     "Acme Platform is headquartered in Paris, France."
                 ),
-                "us_operations": "It has no US operations.",
+                "us_operations": (
+                    "It has no US operations."
+                ),
             },
         }
 
-        service = self._service_for_payload(payload)
+        service = self._service_for_payload(
+            payload
+        )
 
         profile = service._extract_from_text(
             source,
@@ -99,10 +120,17 @@ class CompanyResearchServiceTests(unittest.TestCase):
         self.assertIsNotNone(profile)
         assert profile is not None
 
-        # Currency must be derived from the source evidence,
+        # Currency must be derived from source evidence,
         # not blindly trusted from the LLM payload.
-        self.assertEqual(profile.funding_currency, "USD")
-        self.assertEqual(profile.revenue_currency, "USD")
+        self.assertEqual(
+            profile.funding_currency,
+            "USD",
+        )
+
+        self.assertEqual(
+            profile.revenue_currency,
+            "USD",
+        )
 
         self.assertEqual(
             profile.evidence["technology"],
@@ -123,12 +151,13 @@ class CompanyResearchServiceTests(unittest.TestCase):
         self,
     ) -> None:
         source = (
+            "Acme Platform raised $2M. "
             "Acme Platform is a SaaS company "
             "headquartered in Berlin, Germany."
         )
 
-        # Explicitly remove any local GROQ_MODEL override so this test
-        # verifies the production default.
+        # Explicitly remove any local GROQ_MODEL override so this
+        # test verifies the production default.
         with patch.dict(
             os.environ,
             {"GROQ_MODEL": ""},
@@ -155,24 +184,120 @@ class CompanyResearchServiceTests(unittest.TestCase):
         )
 
         self.assertFalse(
-            completions.last_kwargs["include_reasoning"]
+            completions.last_kwargs[
+                "include_reasoning"
+            ]
         )
 
         self.assertEqual(
-            completions.last_kwargs["max_completion_tokens"],
-            1400,
+            completions.last_kwargs[
+                "max_completion_tokens"
+            ],
+            1000,
         )
 
         self.assertEqual(
-            completions.last_kwargs["response_format"],
-            {"type": "json_object"},
+            completions.last_kwargs[
+                "reasoning_effort"
+            ],
+            "low",
         )
 
-    def test_groq_api_failure_has_separate_diagnostic(self) -> None:
+        # JSON response_format was intentionally removed from
+        # production because Groq gpt-oss-20b was returning
+        # json_validate_failed HTTP 400 errors.
+        #
+        # The production service now parses JSON defensively
+        # using _parse_json_object().
+        self.assertNotIn(
+            "response_format",
+            completions.last_kwargs,
+        )
+
+
+    def test_location_is_recovered_from_explicit_source_text(self) -> None:
+        source = (
+            "Fixture Platform raised $2M. "
+            "Fixture Platform is headquartered in Nairobi, Kenya. "
+            "It sells an AI SaaS platform."
+        )
+        service = self._service_for_payload({
+            "is_company": True,
+            "company_name": "Fixture Platform",
+            "description": "AI SaaS platform",
+            "location": None,
+            "funding_amount": 2_000_000,
+            "evidence": {
+                "funding": "Fixture Platform raised $2M."
+            },
+        })
+        profile = service._extract_from_text(
+            source, "https://source.example/article", "source.example"
+        )
+        self.assertIsNotNone(profile)
+        assert profile is not None
+        self.assertEqual(profile.location, "Nairobi, Kenya")
+        self.assertIn("headquarters", profile.evidence)
+
+
+    def test_recovers_missing_financial_and_technology_evidence(self) -> None:
+        source = (
+            "Everlab raised $3 million in pre-seed funding. "
+            "The company builds an AI operating system for personalized health. "
+            "Everlab is headquartered in Melbourne, Australia."
+        )
+        service = self._service_for_payload({
+            "is_company": True,
+            "company_name": "Everlab",
+            "funding_amount": 3000000,
+            "funding_currency": None,
+            "description": None,
+            "evidence": {},
+        })
+        profile = service._extract_from_text(source, "https://source.example/everlab", "source.example")
+        self.assertIsNotNone(profile)
+        assert profile is not None
+        self.assertEqual(profile.funding_amount, 3000000)
+        self.assertEqual(profile.funding_currency, "USD")
+        self.assertIn("funding", profile.evidence)
+        self.assertIn("technology", profile.evidence)
+        self.assertEqual(profile.location, "Melbourne, Australia")
+
+    def test_rejects_generic_profile_without_financial_signal(self) -> None:
+        source = "Meta is a social media company with products used around the world."
+        service = self._service_for_payload({
+            "is_company": True,
+            "company_name": "Meta",
+            "description": "Social media company",
+            "evidence": {},
+        })
+        profile = service._extract_from_text(source, "https://source.example/meta", "source.example")
+        self.assertIsNone(profile)
+
+    def test_rejects_generic_social_search_page(self) -> None:
+        service = CompanyResearchService(groq_api_key="test-key")
+        result = service.research_search_result(
+            SearchResult(
+                title="Social media — Latest News, Reports & Analysis | The Hacker News",
+                url="https://thehackernews.com/search/label/Social%20media",
+                content="Latest news and reports about social media.",
+            )
+        )
+        self.assertIsNone(result)
+
+    def test_groq_api_failure_has_separate_diagnostic(
+        self,
+    ) -> None:
+
         class FailingCompletions:
+
             def create(self, **kwargs):
-                error = RuntimeError("provider unavailable")
+                error = RuntimeError(
+                    "provider unavailable"
+                )
+
                 error.status_code = 503
+
                 raise error
 
         service = CompanyResearchService(
@@ -201,24 +326,33 @@ class CompanyResearchServiceTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
-        diagnostics = service.consume_diagnostics()
+        diagnostics = (
+            service.consume_diagnostics()
+        )
 
         self.assertEqual(
-            diagnostics["research_api_failures"],
+            diagnostics[
+                "research_api_failures"
+            ],
             1,
         )
 
         self.assertEqual(
-            diagnostics["research_json_failures"],
+            diagnostics[
+                "research_json_failures"
+            ],
             0,
         )
 
         self.assertIn(
             "503",
-            service.consume_last_research_error() or "",
+            service.consume_last_research_error()
+            or "",
         )
 
-    def test_json_failure_has_separate_diagnostic(self) -> None:
+    def test_json_failure_has_separate_diagnostic(
+        self,
+    ) -> None:
         service = self._service_for_payload(
             "not valid json"
         )
@@ -231,24 +365,34 @@ class CompanyResearchServiceTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
-        diagnostics = service.consume_diagnostics()
+        diagnostics = (
+            service.consume_diagnostics()
+        )
 
         self.assertEqual(
-            diagnostics["research_api_failures"],
+            diagnostics[
+                "research_api_failures"
+            ],
             0,
         )
 
         self.assertEqual(
-            diagnostics["research_json_failures"],
+            diagnostics[
+                "research_json_failures"
+            ],
             1,
         )
 
         self.assertEqual(
-            diagnostics["research_extraction_failures"],
+            diagnostics[
+                "research_extraction_failures"
+            ],
             0,
         )
 
-    def test_groq_model_override_still_works(self) -> None:
+    def test_groq_model_override_still_works(
+        self,
+    ) -> None:
         service = CompanyResearchService(
             groq_api_key="test-key",
             model="custom-model",
@@ -263,6 +407,7 @@ class CompanyResearchServiceTests(unittest.TestCase):
         self,
     ) -> None:
         source = (
+            "Acme Platform raised $2M. "
             "Acme Platform sells a SaaS platform "
             "and is headquartered in Berlin, Germany."
         )
@@ -301,12 +446,14 @@ class CompanyResearchServiceTests(unittest.TestCase):
             "End."
         )
 
-        profile = self._service_for_payload(
-            fenced
-        )._extract_from_text(
-            source,
-            "https://source.example",
-            "source.example",
+        profile = (
+            self._service_for_payload(
+                fenced
+            )._extract_from_text(
+                source,
+                "https://source.example",
+                "source.example",
+            )
         )
 
         self.assertIsNotNone(profile)
@@ -317,10 +464,12 @@ class CompanyResearchServiceTests(unittest.TestCase):
             "Acme Platform",
         )
 
-        self.assertNotIn(
+        self.assertIn(
             "funding",
             profile.evidence,
         )
+        self.assertEqual(profile.funding_amount, 2_000_000)
+        self.assertEqual(profile.funding_currency, "USD")
 
         self.assertEqual(
             profile.evidence["technology"],
@@ -331,6 +480,7 @@ class CompanyResearchServiceTests(unittest.TestCase):
         self,
     ) -> None:
         source = (
+            "Acme Platform raised $2M. "
             "Acme Platform is a SaaS company "
             "headquartered in Berlin, Germany."
         )
@@ -341,20 +491,27 @@ class CompanyResearchServiceTests(unittest.TestCase):
             "description": "SaaS company",
         }
 
-        profile = self._service_for_payload(
-            payload
-        )._extract_from_text(
-            source,
-            "https://source.example",
-            "source.example",
+        profile = (
+            self._service_for_payload(
+                payload
+            )._extract_from_text(
+                source,
+                "https://source.example",
+                "source.example",
+            )
         )
 
         self.assertIsNotNone(profile)
         assert profile is not None
 
+        self.assertEqual(profile.location, "Berlin, Germany")
         self.assertEqual(
-            profile.evidence,
-            {},
+            profile.evidence["headquarters"],
+            "headquartered in Berlin, Germany",
+        )
+        self.assertEqual(
+            profile.evidence["location"],
+            "headquartered in Berlin, Germany",
         )
 
     def test_non_company_extraction_increments_diagnostic(
@@ -394,7 +551,9 @@ class CompanyResearchServiceTests(unittest.TestCase):
             groq_api_key="test-key"
         )
 
-        service.fetch_webpage_text = lambda _: None
+        service.fetch_webpage_text = (
+            lambda _: None
+        )
 
         result = service.research_search_result(
             SearchResult(

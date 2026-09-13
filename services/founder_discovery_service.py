@@ -54,7 +54,7 @@ class _FounderCandidate:
 class FounderDiscoveryService:
     """Researches one evidence-supported CEO or founder after Step 4 qualification."""
 
-    DEFAULT_MODEL = "openai/gpt-oss-120b"
+    DEFAULT_MODEL = "openai/gpt-oss-20b"
 
     def __init__(
         self,
@@ -64,7 +64,8 @@ class FounderDiscoveryService:
         page_fetcher: Optional[Callable[[str], Optional[str]]] = None,
     ) -> None:
         self.groq_api_key = groq_api_key or os.getenv("GROQ_API_KEY")
-        self.model = model or os.getenv("GROQ_MODEL", self.DEFAULT_MODEL)
+        configured_model = os.getenv("GROQ_MODEL")
+        self.model = model or (configured_model.strip() if configured_model else "") or self.DEFAULT_MODEL
         self.search_service = search_service or TavilySearchService()
         self.page_fetcher = page_fetcher or CompanyResearchService().fetch_webpage_text
         self.client: Optional[Groq] = None
@@ -145,7 +146,17 @@ class FounderDiscoveryService:
             return None
         if not self._source_contains(evidence, source_text):
             return None
-        if re.search(NEGATED_ROLE_PATTERN, evidence, re.I):
+        if profile.company_name.lower() not in evidence.lower():
+            return None
+        if name.lower() not in evidence.lower():
+            return None
+        if profile.company_name.lower() in name.lower():
+            return None
+        if re.search(r"\b(?:cto|chief technology officer|coo|cmo|advisor|investor|board member|employee)\b", name, re.I):
+            return None
+        if re.search(r"\b(?: of | at | the | and | for )\b", name, re.I):
+            return None
+        if re.search(r"\b(?:not|former|previous)\s+(?:the\s+)?(?:ceo|chief executive officer|co[- ]?founder|founder)\b", evidence, re.I):
             return None
         role_rank = self._role_rank(role)
         if role_rank is None:
@@ -159,7 +170,52 @@ class FounderDiscoveryService:
             evidence=evidence, role_rank=role_rank, source_rank=self._source_rank(source_url, profile),
         )
 
+    def _deterministic_candidates(self, source_text: str, source_url: str, profile: CompanyProfile) -> List[_FounderCandidate]:
+        """Extract obvious CEO/founder statements without spending a Groq call."""
+        candidates: List[_FounderCandidate] = []
+        normalized = " ".join(source_text.split())
+        for sentence in re.split(r"(?<=[.!?])\s+|\n+", normalized):
+            if profile.company_name.lower() not in sentence.lower():
+                continue
+            # Keep person-name matching case-sensitive. The previous use of
+            # re.I let role/company fragments such as "CTO of Catalog" become
+            # part of the person's name when HTML text was concatenated.
+            name_token = r"[A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){1,3}"
+            company = re.escape(profile.company_name)
+            patterns = (
+                rf"(?P<name>{name_token})\s*,?\s+(?:(?i:is)\s+)?(?:(?i:the)\s+)?(?P<role>(?i:CEO|Chief Executive Officer|Co-Founder|Founder)(?:(?i:\s+(?:and|&)\s+)(?i:CEO|Chief Executive Officer|Co-Founder|Founder))?)\s+(?i:of|at)\s+{company}\b",
+                rf"{company}(?:'s|’s)\s+(?P<role>(?i:CEO|Chief Executive Officer|Co-Founder|Founder)(?:(?i:\s+(?:and|&)\s+)(?i:CEO|Chief Executive Officer|Co-Founder|Founder))?)\s+(?P<name>{name_token})\b",
+                rf"(?i:(?:founded|co-founded))\s+(?i:(?:by|the company was founded by))\s+(?P<name>{name_token})\b",
+            )
+            for pattern in patterns:
+                match = re.search(pattern, sentence)
+                if not match:
+                    continue
+                name = match.group("name").strip(" ,:-")
+                role = match.groupdict().get("role") or "Founder"
+                role_rank = self._role_rank(role)
+                if role_rank is None or not name:
+                    continue
+                validated = self._candidate_from_data(
+                    {"founder_name": name, "role": role, "evidence": sentence.strip()},
+                    sentence.strip(),
+                    source_url,
+                    profile,
+                )
+                if validated:
+                    candidates.append(validated)
+                    break
+        return candidates
+
     def _extract_candidates(self, source_text: str, source_url: str, profile: CompanyProfile) -> List[_FounderCandidate]:
+        # Prefer an exact role/name statement already present in the source.
+        deterministic = self._deterministic_candidates(source_text, source_url, profile)
+        if deterministic:
+            return deterministic
+
+        # Founder extraction needs only a compact evidence window. This keeps
+        # the Groq TPM footprint bounded without changing evidence validation.
+        source_text = source_text[:4500]
         self._validate_client()
         assert self.client is not None
         prompt = (
@@ -176,13 +232,20 @@ class FounderDiscoveryService:
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": f"Company: {profile.company_name}\nSource URL: {source_url}\n\nSource content:\n{source_text}"},
             ],
-            response_format={"type": "json_object"}, temperature=0.0,
+            include_reasoning=False,
+            reasoning_effort="low",
+            max_completion_tokens=900,
+            temperature=0.0,
         )
         raw = response.choices[0].message.content
         if not raw:
             return []
-        payload = json.loads(raw)
-        if not payload.get("company_match"):
+        try:
+            payload = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            logger.warning("Founder extraction returned invalid JSON | Source: %s", source_url)
+            return []
+        if not isinstance(payload, dict) or not payload.get("company_match"):
             return []
         return [
             candidate for item in payload.get("candidates", [])
@@ -228,11 +291,22 @@ class FounderDiscoveryService:
         extraction_errors = 0
         contradictory_evidence = False
         for result in results:
-            source_text = self.page_fetcher(result.url) or result.content
+            fetched_text = self.page_fetcher(result.url) or ""
+            # Keep Tavily's result title/snippet alongside fetched page text.
+            # Founder names are often present in the search snippet even when
+            # the target page truncates or blocks the relevant section.
+            source_text = "\n".join(
+                part for part in (result.title, result.content, fetched_text) if part
+            )
             if not source_text:
                 continue
-            if re.search(NEGATED_ROLE_PATTERN, source_text, re.I):
-                contradictory_evidence = True
+            # A negated CEO/founder statement only matters when the same
+            # sentence/block also refers to this company. Unrelated mentions
+            # on long pages must not invalidate a valid founder candidate.
+            for chunk in re.split(r"(?<=[.!?])\s+|\n+", source_text):
+                if profile.company_name.lower() in chunk.lower() and re.search(NEGATED_ROLE_PATTERN, chunk, re.I):
+                    contradictory_evidence = True
+                    break
             try:
                 candidates.extend(self._extract_candidates(source_text, result.url, profile))
             except Exception as exc:

@@ -22,19 +22,28 @@ if not logger.handlers:
 USD_MINIMUM = 1_000_000
 USD_MAXIMUM = 5_000_000
 TECHNOLOGY_PATTERNS = (
-    r"\bsaas\b", r"\bsoftware\b", r"\b(?:ai|artificial intelligence)[ -]?(?:powered )?(?:platform|software)\b",
-    r"\b(?:cloud|data|cybersecurity|fintech|healthcare technology|education technology|developer|api|workflow automation) platform\b",
-    r"\benterprise software\b", r"\bplatform\b",
+    r"\bsaas\b",
+    r"\bsoftware\b",
+    r"\b(?:ai|artificial intelligence)[ -]?(?:powered )?(?:platform|software|system|product|tool)\b",
+    r"\b(?:cloud|data|cybersecurity|fintech|healthcare technology|healthtech|digital health|education technology|developer|api|workflow automation) platform\b",
+    r"\b(?:ai|artificial intelligence|cybersecurity|healthtech|digital health|fintech|operating system)\b",
+    r"\benterprise software\b",
+    r"\bplatform\b",
 )
 CONSULTING_PATTERNS = (r"\bconsulting\b", r"\bit services\b", r"\bagency\b", r"\bprofessional services\b")
 US_OPERATION_PATTERNS = (
-    r"\b(?:headquartered|based) in (?:the )?(?:united states|usa|u\.s\.)\b",
-    r"\b(?:united states|usa|u\.s\.)[ -](?:based|headquartered)\b", r"\bus headquarters?\b",
-    r"\b(?:new york|san francisco|california|boston|austin|seattle),? (?:usa|us|united states)\b",
-    r"\bmajor us office\b", r"\bprimary operations? in the (?:us|united states)\b",
+    r"\b(?:headquartered|headquarters|based|located)\s+(?:in|at)\s+(?:the )?(?:united states|usa|u\.s\.|us)\b",
+    r"\b(?:united states|usa|u\.s\.|us)[ -](?:based|headquartered)\b",
+    r"\bus headquarters?\b",
+    r"\b(?:major|primary|main|significant)\s+(?:us|u\.s\.|united states)\s+(?:office|operations?|presence|hub)\b",
+    r"\b(?:office|operations?|presence|hub)\s+(?:in|across)\s+(?:the )?(?:us|u\.s\.|united states)\b",
 )
 NON_US_LOCATION_PATTERNS = (
-    r"\b(?:paris|france|london|united kingdom|uk|berlin|germany|europe|india|singapore|indonesia|vietnam|uae|saudi arabia|egypt|brazil|mexico|colombia|australia|new zealand|canada|japan|south korea)\b",
+    r"\b(?:headquartered|headquarters|based|located)\s+(?:in|at)\s+(?!the united states|united states|usa|u\.s\.|us\b)[^.;|]{2,80}",
+    r"\b(?:based|headquartered|located)\s+(?:out of|within)\s+(?!the united states|united states|usa|u\.s\.|us\b)[^.;|]{2,80}",
+    r"\b[^.;|]{2,80}[- ]based\b",
+    r"\b(?:hq|h\.q\.)\s+(?:in|at)\s+(?!the united states|united states|usa|u\.s\.|us\b)[^.;|]{2,80}",
+    r"\b(?:paris|france|london|united kingdom|uk|berlin|germany|europe|india|singapore|indonesia|vietnam|uae|saudi arabia|egypt|brazil|mexico|colombia|australia|new zealand|canada|japan|south korea|netherlands|spain|italy|ireland|sweden|norway|denmark|finland|poland|portugal|kenya|nigeria|south africa|israel|turkey|argentina|chile)\b",
 )
 MEDIUM_QUALITY_DOMAINS = {"techcrunch.com", "sifted.eu", "tech.eu", "venturebeat.com", "eu-startups.com", "uktech.news"}
 LOW_QUALITY_DOMAINS = {"crunchbase.com", "pitchbook.com", "dealroom.co", "startupintros.com"}

@@ -43,7 +43,7 @@ class EmailDiscoveryService:
                  max_workers: int = 1) -> None:
         self.groq_api_key = groq_api_key or os.getenv("GROQ_API_KEY")
         configured_model = os.getenv("GROQ_MODEL")
-        self.model = model or configured_model or self.DEFAULT_MODEL
+        self.model = model or (configured_model.strip() if configured_model else "") or self.DEFAULT_MODEL
         self.search_service = search_service or TavilySearchService()
         self.page_fetcher = page_fetcher or CompanyResearchService().fetch_webpage_text
         self.max_workers = max(1, min(max_workers, 4))
@@ -63,8 +63,11 @@ class EmailDiscoveryService:
     def build_queries(self, company: CompanyProfile, founder: FounderProfile) -> List[str]:
         name, founder_name = company.company_name, founder.founder_name or ""
         queries = [
-            f'"{founder_name}" "{name}" email', f'"{founder_name}" "{name}" contact',
-            f'"{founder_name}" CEO email', f'"{founder_name}" founder email',
+            f'"{founder_name}" "{name}" email',
+            f'"{founder_name}" "{name}" contact',
+            f'"{founder_name}" CEO email',
+            f'"{founder_name}" founder email',
+            f'"{founder_name}" "@"',
         ]
         if domain := self._domain(company.website):
             queries.insert(0, f'"{founder_name}" "{domain}"')
@@ -106,7 +109,24 @@ class EmailDiscoveryService:
         if not self._source_contains(evidence, source):
             return None
         company_domain = self._domain(company.website)
-        confidence = "high" if company_domain and email.endswith(f"@{company_domain}") else "medium"
+        email_domain = email.split("@", 1)[1].lower()
+        if company_domain and email_domain != company_domain:
+            return None
+        if not company_domain:
+            source_domain = urlparse(url).netloc.lower().removeprefix("www.")
+            blocked_domains = {
+                "rocketreach.co", "signalhire.com", "apollo.io", "zoominfo.com",
+                "lead411.com", "theorg.com", "wellfound.com", "crunchbase.com",
+                "startupfundraising.com", "linkedin.com", "facebook.com",
+                "instagram.com", "x.com", "twitter.com",
+            }
+            # Without an independently known company domain, only accept a
+            # founder email from the same non-social, non-contact-data domain
+            # as the source page. This blocks false positives such as a
+            # fundraising agency email attached to a founder's name.
+            if source_domain in blocked_domains or email_domain != source_domain:
+                return None
+        confidence = "high" if company_domain and email_domain == company_domain else "medium"
         return EmailCandidate(company_name=company.company_name, founder_name=founder_name,
                               founder_role=founder.role or "", email=email, source_url=url,
                               evidence=evidence, source_type=self._source_type(url, company),
@@ -147,6 +167,50 @@ class EmailDiscoveryService:
         end = min(len(text), start + max_chars)
         return text[start:end]
 
+    def _deterministic_candidates(self, source: str, url: str, company: CompanyProfile, founder: FounderProfile) -> List[EmailCandidate]:
+        """Extract explicit founder emails using sentence and proximity evidence; never invent an address."""
+        name = (founder.founder_name or "").strip()
+        if not name:
+            return []
+        text = " ".join((source or "").split())
+        candidates: List[EmailCandidate] = []
+
+        # First: strongest evidence — founder name and email in the same sentence/block.
+        blocks = re.split(r"(?<=[.!?])\s+|\n+|(?<=:)\s+", text)
+        for block in blocks:
+            if name.lower() not in block.lower():
+                continue
+            for email in self._explicit_emails(block):
+                candidate = self._candidate_from_data(
+                    {"email": email, "evidence": block}, block, url, company, founder
+                )
+                if candidate:
+                    candidates.append(candidate)
+
+        if candidates:
+            return candidates
+
+        # Second: many public team/contact pages put the person's name, role, and
+        # email in adjacent HTML/text blocks rather than one sentence. Accept only
+        # an explicit email within a tight window around the exact founder name.
+        lower = text.lower()
+        name_pos = lower.find(name.lower())
+        if name_pos < 0:
+            return []
+
+        window_start = max(0, name_pos - 700)
+        window_end = min(len(text), name_pos + len(name) + 700)
+        window = text[window_start:window_end]
+        for email in self._explicit_emails(window):
+            evidence = window.strip()
+            candidate = self._candidate_from_data(
+                {"email": email, "evidence": evidence}, evidence, url, company, founder
+            )
+            if candidate:
+                candidates.append(candidate)
+
+        return candidates
+
     def _extract_candidates(self, source: str, url: str, company: CompanyProfile,
                             founder: FounderProfile) -> List[EmailCandidate]:
         # Never call the LLM when the source contains no explicit email.
@@ -154,6 +218,10 @@ class EmailDiscoveryService:
         explicit_emails = self._explicit_emails(source)
         if not explicit_emails:
             return []
+
+        deterministic = self._deterministic_candidates(source, url, company, founder)
+        if deterministic:
+            return deterministic
 
         self._validate_client()
         assert self.client is not None
@@ -183,9 +251,9 @@ class EmailDiscoveryService:
                     ),
                 },
             ],
-            response_format={"type": "json_object"},
             include_reasoning=False,
-            max_completion_tokens=500,
+            reasoning_effort="low",
+            max_completion_tokens=800,
             temperature=0.0,
         )
 
@@ -217,6 +285,7 @@ class EmailDiscoveryService:
 
     @staticmethod
     def _select(candidates: List[EmailCandidate], company: CompanyProfile) -> Optional[EmailCandidate]:
+        candidates = [candidate for candidate in candidates if candidate is not None]
         if not candidates:
             return None
         company_domain = EmailDiscoveryService._domain(company.website)
@@ -254,7 +323,11 @@ class EmailDiscoveryService:
 
     def _fetch_sources(self, results: List[SearchResult]) -> List[tuple[SearchResult, str]]:
         def fetch(result: SearchResult) -> tuple[SearchResult, str]:
-            return result, self.page_fetcher(result.url) or result.content
+            fetched_text = self.page_fetcher(result.url) or ""
+            source = "\n".join(
+                part for part in (result.title, result.content, fetched_text) if part
+            )
+            return result, source
 
         with ThreadPoolExecutor(max_workers=min(self.max_workers, max(1, len(results)))) as executor:
             fetched = list(executor.map(fetch, results))
@@ -274,6 +347,7 @@ class EmailDiscoveryService:
             item for item in sources
             if self._explicit_emails(item[1])
         ]
+        logger.info("Email discovery sources with explicit emails | Company: %s | Eligible: %d/%d", company.company_name, len(eligible_sources), len(sources))
 
         for result, source in eligible_sources:
             try:
@@ -299,6 +373,7 @@ class EmailDiscoveryService:
         sources = self._fetch_sources(results)
         candidates, extraction_errors = self._extract_sources(sources, company, founder)
         errors = extraction_errors
+        logger.info("Email discovery candidates | Company: %s | Candidates: %d | Errors: %d", company.company_name, len(candidates), errors)
         selected = self._select(candidates, company)
         if selected:
             logger.info("Email discovered | Company: %s | Founder: %s", company.company_name, founder.founder_name)
